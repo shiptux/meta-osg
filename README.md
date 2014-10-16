@@ -1,4 +1,5 @@
 meta-osg
 ========
 
-Yocto layer for OpenSceneGraph and related libraries.
+Yocto layer for OpenSceneGraph and various OSG extension NodeKits,
+including their dependencies.
