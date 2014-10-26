@@ -5,7 +5,7 @@ SRC_URI = "svn://osgcairo.googlecode.com/svn/tags;module=1.5.0;protocol=http"
 
 S = "${WORKDIR}/1.5.0"
 
-DEPENDS = "openscenegraph"
+DEPENDS = "openscenegraph cairo"
 
 inherit pkgconfig cmake
 

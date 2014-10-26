@@ -6,7 +6,17 @@ SRC_URI = "http://www.openscenegraph.org/downloads/developer_releases/OpenSceneG
 
 S = "${WORKDIR}/OpenSceneGraph-${PV}"
 
-DEPENDS += "mesa-gl"
+DEPENDS += "\
+	mesa-gl \
+	libpng \
+	jpeg \
+	tiff \
+	giflib \
+	jasper \
+	collada-dom \
+	libsdl \
+	xrandr \
+"
 
 inherit pkgconfig cmake
 
