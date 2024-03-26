@@ -1,0 +1,38 @@
+From fb0f933bb76132ec09468fa68af7daaf5a9f99a0 Mon Sep 17 00:00:00 2001
+From: shiptux <shiptux@gmail.com>
+Date: Mon, 18 Sep 2023 20:48:33 +0800
+Subject: [PATCH 1/2] Add cross compile conf for OSG
+
+---
+ toolchain-arm64-linux.cmake | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100644 toolchain-arm64-linux.cmake
+
+diff --git a/toolchain-arm64-linux.cmake b/toolchain-arm64-linux.cmake
+new file mode 100644
+index 000000000..7ccd95819
+--- /dev/null
++++ b/toolchain-arm64-linux.cmake
+@@ -0,0 +1,19 @@
++set(CMAKE_SYSTEM_NAME Linux)
++set(CMAKE_SYSTEM_PROCESSOR aarch64)
++set(TARGET_ABI "linux-gnu")
++SET(CMAKE_C_COMPILER   aarch64-${TARGET_ABI}-gcc)
++SET(CMAKE_CXX_COMPILER aarch64-${TARGET_ABI}-g++)
++
++SET(CMAKE_FIND_ROOT_PATH "/usr/aarch64-${TARGET_ABI}")
++SET(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++SET(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++find_program(GCC_FULL_PATH aarch64-${TARGET_ABI}-gcc)
++if (NOT GCC_FULL_PATH)
++  message(FATAL_ERROR "Cross-compiler aarch64-${TARGET_ABI}-gcc not found")
++endif ()
++get_filename_component(GCC_DIR ${GCC_FULL_PATH} PATH)
++SET(CMAKE_LINKER       ${GCC_DIR}/aarch64-${TARGET_ABI}-ld      CACHE FILEPATH "linker")
++SET(CMAKE_ASM_COMPILER ${GCC_DIR}/aarch64-${TARGET_ABI}-as      CACHE FILEPATH "assembler")
++SET(CMAKE_OBJCOPY      ${GCC_DIR}/aarch64-${TARGET_ABI}-objcopy CACHE FILEPATH "objcopy")
++SET(CMAKE_STRIP        ${GCC_DIR}/aarch64-${TARGET_ABI}-strip   CACHE FILEPATH "strip")
++SET(CMAKE_CPP          ${GCC_DIR}/aarch64-${TARGET_ABI}-cpp     CACHE FILEPATH "cpp")
+-- 
+2.40.1
+

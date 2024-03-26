@@ -1,0 +1,30 @@
+From 6725bb33214ac387a38c58d14444796b42672e65 Mon Sep 17 00:00:00 2001
+From: shiptux <shiptux@gmail.com>
+Date: Mon, 18 Sep 2023 23:05:05 +0800
+Subject: [PATCH] Enable gles2 for OPENGL_gl_LIBRARY
+
+---
+ CMakeLists.txt | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c98408d84..a149ec7e6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -664,7 +664,12 @@ IF(ANDROID)
+     ENDIF()
+ ENDIF()
+ 
+-
++        FIND_PATH(OPENGL_INCLUDE_DIR GLES2/gl2.h
++              PATHS
++                  /usr/include)
++        FIND_LIBRARY(OPENGL_gl_LIBRARY  GLESv2
++                 PATHS
++                     /usr/lib)
+ ################################################################################
+ # Set Config header file
+ 
+-- 
+2.40.1
+

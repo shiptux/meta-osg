@@ -1,0 +1,41 @@
+From 8176d6e83d0cdcfe6d9ebadd741e26158865b415 Mon Sep 17 00:00:00 2001
+From: shiptux <shiptux@gmail.com>
+Date: Mon, 18 Sep 2023 21:00:49 +0800
+Subject: [PATCH] Disable try_run in cross compile
+
+---
+ CMakeModules/CheckAtomicOps.cmake   | 4 ++++
+ CMakeModules/FindPoppler-glib.cmake | 2 +-
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeModules/CheckAtomicOps.cmake b/CMakeModules/CheckAtomicOps.cmake
+index 11ddae566..820c92918 100644
+--- a/CMakeModules/CheckAtomicOps.cmake
++++ b/CMakeModules/CheckAtomicOps.cmake
+@@ -2,6 +2,10 @@
+ # This module defines
+ # OPENTHREADS_HAVE_ATOMIC_OPS
+ 
++IF (CMAKE_CROSSCOMPILING)
++	RETURN()
++ENDIF ()
++
+ OPTION(OPENTHREADS_ATOMIC_USE_MUTEX "Set to ON to force OpenThreads to use a mutex for Atmoic." OFF)
+ 
+ IF (OPENTHREADS_ATOMIC_USE_MUTEX)
+diff --git a/CMakeModules/FindPoppler-glib.cmake b/CMakeModules/FindPoppler-glib.cmake
+index d89a186f2..5c3fff88c 100644
+--- a/CMakeModules/FindPoppler-glib.cmake
++++ b/CMakeModules/FindPoppler-glib.cmake
+@@ -8,7 +8,7 @@ IF(PKG_CONFIG_FOUND)
+     PKG_CHECK_MODULES(CAIRO cairo)
+     PKG_CHECK_MODULES(POPPLER poppler-glib)
+ 
+-    IF (POPPLER_FOUND)
++    IF (POPPLER_FOUND AND NOT CMAKE_CROSSCOMPILING)
+ 
+         INCLUDE(CheckCXXSourceRuns)
+ 
+-- 
+2.40.1
+

@@ -1,0 +1,3769 @@
+From f4ea40e522c9486c2c855310e12be42d1cf3b124 Mon Sep 17 00:00:00 2001
+From: shiptux <shiptux@gmail.com>
+Date: Tue, 17 Oct 2023 20:51:42 +0800
+Subject: [PATCH] Wayland graphics support
+
+Adds native Wayland graphics support, change summary:
+- Minor build changes to link appropriate libraries and build new sources provided libwayland-dev and wayland-protocols packages are available (via a new CMakeModules/FindWayland.cmake helper).
+- New source: src/osgViewer/GraphicsWindowWayland.cpp and supporting (generated) protocols (src/osgViewer/xdg*) to communicate with Wayland compositors.
+- Minor fixes to src/osg/GraphicsContext.cpp to automatically select a working graphics backend at startup, while allowing manual selection through an environment variable OSG_WINDOWING_SYSTEM
+This applies against current master and works with both osgviewer and as a patch to FlightGear (my chosen test app!)
+It has been independently tested by @shiptux on sway, kwin and weston compositors.
+
+Signoff: phlash <phil.github@ashbysoft.com>
+---
+ CMakeLists.txt                             |    5 +
+ CMakeModules/FindWayland.cmake             |   15 +
+ src/osg/GraphicsContext.cpp                |   30 +-
+ src/osgViewer/CMakeLists.txt               |   10 +
+ src/osgViewer/GraphicsWindowWayland.cpp    |  986 ++++++++++
+ src/osgViewer/GraphicsWindowWayland.h      |   15 +
+ src/osgViewer/xdg-decoration-unstable-v1.c |   65 +
+ src/osgViewer/xdg-decoration-unstable-v1.h |  376 ++++
+ src/osgViewer/xdg-shell.c                  |  171 ++
+ src/osgViewer/xdg-shell.h                  | 1970 ++++++++++++++++++++
+ 10 files changed, 3636 insertions(+), 7 deletions(-)
+ create mode 100644 CMakeModules/FindWayland.cmake
+ create mode 100644 src/osgViewer/GraphicsWindowWayland.cpp
+ create mode 100644 src/osgViewer/GraphicsWindowWayland.h
+ create mode 100644 src/osgViewer/xdg-decoration-unstable-v1.c
+ create mode 100644 src/osgViewer/xdg-decoration-unstable-v1.h
+ create mode 100644 src/osgViewer/xdg-shell.c
+ create mode 100644 src/osgViewer/xdg-shell.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e858f1b4c..a30a48162 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -864,6 +864,11 @@ IF(NOT (ANDROID AND OSG_FIND_3RD_PARTY_DEPS))
+     ENDIF()
+ ENDIF()
+ 
++IF(OSG_WINDOWING_SYSTEM STREQUAL "X11")
++  # optional Wayland graphics also supported..
++  FIND_PACKAGE(Wayland)
++ENDIF()
++
+ ################################################################################
+ # Create bin and lib directories if required
+ 
+diff --git a/CMakeModules/FindWayland.cmake b/CMakeModules/FindWayland.cmake
+new file mode 100644
+index 000000000..98dd9acb5
+--- /dev/null
++++ b/CMakeModules/FindWayland.cmake
+@@ -0,0 +1,15 @@
++# Find Wayland development libraries & headers for wayland-egl & wayland-cursor & EGL & XKBcommon
++#
++# WAYLAND_FOUND - system has a libwayland-[egl|client|cursor] + libEGL + libxkbcommon
++# WAYLAND_INCLUDE_DIR - where to find header files
++# WAYLAND_LIBRARIES - the libraries to link against Wayland
++#
++# copyright (c) 2022 Phil Ashby <phil.github@ashbysoft.com>
++# Redistribution and use of this file is allowed according to the terms of the BSD license.
++#
++
++# Use PkgConfig to find includes and libs
++find_package(PkgConfig QUIET)
++if (PKG_CONFIG_FOUND)
++	PKG_CHECK_MODULES(WAYLAND QUIET wayland-egl wayland-cursor egl xkbcommon)
++endif ()
+diff --git a/src/osg/GraphicsContext.cpp b/src/osg/GraphicsContext.cpp
+index 0d14aaf8e..bd62f98de 100644
+--- a/src/osg/GraphicsContext.cpp
++++ b/src/osg/GraphicsContext.cpp
+@@ -75,28 +75,44 @@ GraphicsContext::WindowingSystemInterface* GraphicsContext::WindowingSystemInter
+         OSG_WARN<<"Warning: GraphicsContext::WindowingSystemInterfaces::getWindowingSystemInterface() failed, no interfaces available."<<std::endl;
+         return 0;
+     }
++    std::string search = name;
++    if (getenv("OSG_WINDOWING_SYSTEM") != NULL)
++    {
++        search = getenv("OSG_WINDOWING_SYSTEM");
++    }
+ 
+-    if (!name.empty())
++    if (!search.empty())
+     {
+         for(Interfaces::iterator itr = _interfaces.begin();
+             itr != _interfaces.end();
+             ++itr)
+         {
+-            if ((*itr)->getName()==name)
++            if ((*itr)->getName()==search)
+             {
++                OSG_INFO<<"found WindowingSystemInterface : "<<search<<std::endl;
+                 return itr->get();
+             }
+-
+-            OSG_NOTICE<<"   tried interface "<<typeid(*itr).name()<<", name= "<<(*itr)->getName()<<std::endl;
+         }
+ 
+-        OSG_WARN<<"Warning: GraphicsContext::WindowingSystemInterfaces::getWindowingSystemInterface() failed, no interfaces matches name : "<<name<<std::endl;
++        OSG_WARN<<"Warning: GraphicsContext::WindowingSystemInterfaces::getWindowingSystemInterface() failed, no interfaces matches name : "<<search<<std::endl;
+         return 0;
+     }
+     else
+     {
+-        // no preference provided so just take the first available interface
+-        return _interfaces.front().get();
++        // no preference provided so just take the first available interface that works
++        for (Interfaces::iterator itr = _interfaces.begin();
++            itr != _interfaces.end();
++            ++itr)
++        {
++            if ((*itr)->getNumScreens() > 0)
++            {
++                OSG_INFO<<"using default WindowingSystemInterface : "<<(*itr)->getName()<<std::endl;
++                return itr->get();
++            }
++        }
++
++        OSG_WARN<<"Warning: GraphicsContext::WindowingSystemInterfaces::getWindowingSystemInterface() failed, no working interfaces"<<std::endl;
++        return 0;
+     }
+ }
+ 
+diff --git a/src/osgViewer/CMakeLists.txt b/src/osgViewer/CMakeLists.txt
+index aac4bbba4..8430f7387 100644
+--- a/src/osgViewer/CMakeLists.txt
++++ b/src/osgViewer/CMakeLists.txt
+@@ -248,6 +248,16 @@ ELSE()
+ 
+           SET(LIB_EXTRA_LIBS ${X11_X11_LIB} ${LIB_EXTRA_LIBS})
+         ENDIF(APPLE)
++
++        # Add Wayland here if available..
++        IF(WAYLAND_FOUND)
++          ADD_DEFINITIONS(-DOSGVIEWER_USE_WAYLAND)
++          SET(LIB_COMMON_FILES ${LIB_COMMON_FILES}
++            GraphicsWindowWayland.cpp
++            xdg-shell.c
++            xdg-decoration-unstable-v1.c)
++          SET(LIB_EXTRA_LIBS ${WAYLAND_LIBRARIES} ${LIB_EXTRA_LIBS})
++        ENDIF()
+     ELSE()
+         MESSAGE(STATUS "Windowing system not supported")
+     ENDIF()
+diff --git a/src/osgViewer/GraphicsWindowWayland.cpp b/src/osgViewer/GraphicsWindowWayland.cpp
+new file mode 100644
+index 000000000..6f1d61f64
+--- /dev/null
++++ b/src/osgViewer/GraphicsWindowWayland.cpp
+@@ -0,0 +1,986 @@
++// an OSG GraphicsWindow backed by raw Wayland/EGL
++
++#include <iostream>
++#include <sstream>
++#include <iomanip>
++#include <unistd.h>
++#include <osgViewer/GraphicsWindow>
++#include "GraphicsWindowWayland.h"
++#include <wayland-egl.h>
++#include <wayland-cursor.h>
++#include <EGL/egl.h>
++#include <linux/input-event-codes.h>
++#include <xkbcommon/xkbcommon.h>
++#include <sys/mman.h>
++#include "xdg-shell.h"
++#include "xdg-decoration-unstable-v1.h"
++
++namespace com {
++    namespace ashbysoft {
++
++// graphics context state (shared)
++#define MAX_OUTPUTS 16
++class WLGraphicsWindow;
++struct gc_client_state {
++    // stuff we reference from the server
++    struct wl_display* display;
++    struct wl_registry* registry;
++    struct wl_shm* shm;
++    struct wl_compositor* compositor;
++    struct wl_output* output[MAX_OUTPUTS];
++    struct xdg_wm_base* xdg_wm_base;
++    struct zxdg_decoration_manager_v1* zxdg_decoration_manager_v1;
++    struct wl_seat* seat;
++    struct wl_keyboard* keyboard;
++    struct wl_pointer* pointer;
++    struct wl_data_device_manager* data_device_manager;
++    EGLDisplay egl_display;
++    size_t n_outputs;
++    int32_t output_width[MAX_OUTPUTS];
++    int32_t output_height[MAX_OUTPUTS];
++    // shared cursor theme & lookup map of loaded cursors
++    wl_cursor_theme* cursor_theme;
++    std::map<osgViewer::GraphicsWindow::MouseCursor, wl_cursor*> cursors;
++    // lookup map of windows
++    std::map<struct wl_surface*, WLGraphicsWindow*> windows;
++    // current seat caps
++    uint32_t seat_caps;
++    // XKB context, state & current mapping
++    struct xkb_context* xkb_content;
++    struct xkb_state* xkb_state;
++    struct xkb_keymap* xkb_keymap;
++    // last pointer position
++    float pointer_x;
++    float pointer_y;
++    // current active surfaces (can be null)
++    struct wl_surface* keyboard_surface;
++    struct wl_surface* pointer_surface;
++    uint32_t keyboard_serial;
++    // repeat state
++    int32_t keyboard_repeat;
++    int32_t keyboard_delay;
++    uint64_t keyboard_tick;
++    int keyboard_state;
++    int keyboard_last;
++    #define KEYBOARD_IDLE   0
++    #define KEYBOARD_DELAY  1
++    #define KEYBOARD_REPEAT 2
++};
++// graphics window state (instanced)
++struct gw_client_state {
++    // ref to shared state
++    struct gc_client_state* gc;
++    // stuff we create
++    struct wl_surface* surface;
++    struct xdg_surface* xdg_surface;
++    struct xdg_toplevel* xdg_toplevel;
++    struct zxdg_toplevel_decoration_v1* zxdg_toplevel_decoration_v1;
++    struct wl_callback* framecb;
++    struct wl_egl_window* egl_window;
++    EGLConfig egl_config;
++    EGLContext egl_context;
++    EGLSurface egl_surface;
++    wl_surface* cursor_surface;
++    wl_pointer* cursor_pointer;
++    uint32_t cursor_serial;
++    osgViewer::GraphicsWindow::MouseCursor cursor_last;
++    bool floating;
++    int width;
++    int height;
++    bool pending_config;
++};
++
++// logging depth and support macro
++static thread_local int t_depth;
++#define WLGWlog(_e) std::cerr << std::setfill('.') << std::setw(_e>0 ? t_depth++ : _e<0 ? --t_depth: t_depth) << ""
++
++class WLGraphicsWindow : public osgViewer::GraphicsWindow {
++private:
++    bool _valid = false;
++    bool _realized = false;
++    struct gw_client_state _gw = {0};
++    struct xdg_surface_listener _xdg_surface_listener;
++    struct xdg_toplevel_listener _xdg_toplevel_listener;
++    std::string _logname;
++
++    static void xdg_surface_configure(void* data, struct xdg_surface* xdg_surface, uint32_t serial) {
++        WLGraphicsWindow* obj = (WLGraphicsWindow*)data;
++        // tell the compositor we're ok with the config
++        xdg_surface_ack_configure(xdg_surface, serial);
++        // apply pending config changes (if any)
++        if (obj->_gw.pending_config) {
++            // size changes
++            wl_egl_window_resize(obj->_gw.egl_window, obj->_gw.width, obj->_gw.height, 0, 0);
++            obj->resized(0, 0, obj->_gw.width, obj->_gw.height);                // camera(s), also updates _traits
++            obj->getEventQueue()->windowResize(obj->_traits->x, obj->_traits->y, obj->_traits->width, obj->_traits->height);     // event co-ords & GUI
++            // floating? then decorated if we have the option
++            if (obj->_gw.zxdg_toplevel_decoration_v1) {
++                if (obj->_gw.floating)
++                    zxdg_toplevel_decoration_v1_set_mode(obj->_gw.zxdg_toplevel_decoration_v1, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++                else
++                    zxdg_toplevel_decoration_v1_set_mode(obj->_gw.zxdg_toplevel_decoration_v1, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
++            }
++            obj->_gw.pending_config = false;
++            WLGWlog(0) << obj->_logname << "<xdg surface configure: " << obj->_gw.width << 'x' << obj->_gw.height << "," << obj->_gw.floating << ">" << std::endl;
++        } else {
++            WLGWlog(0) << obj->_logname << "<xdg surface configure (no action)>" << std::endl;
++        }
++    }
++    static void xdg_toplevel_close(void* data, xdg_toplevel* toplevel) {
++        WLGraphicsWindow* obj = (WLGraphicsWindow*)data;
++        obj->close(true);
++        WLGWlog(0) << obj->_logname << "<toplevel closed>" << std::endl;
++    }
++    static void xdg_toplevel_configure(void* data, xdg_toplevel* toplevel, int width, int height, wl_array* states) {
++        WLGraphicsWindow* obj = (WLGraphicsWindow*)data;
++        // if width or height are zero, ignore
++        if (!width || !height)
++            return;
++        // determine if we are a floating window
++        bool floating=true;
++        enum xdg_toplevel_state* pstate = (enum xdg_toplevel_state*)states->data;
++        while ((const char*)pstate < (const char*)(states->data)+states->size) {
++            if (*pstate==XDG_TOPLEVEL_STATE_TILED_BOTTOM ||
++                *pstate==XDG_TOPLEVEL_STATE_TILED_LEFT ||
++                *pstate==XDG_TOPLEVEL_STATE_TILED_RIGHT ||
++                *pstate==XDG_TOPLEVEL_STATE_TILED_TOP ||
++                *pstate==XDG_TOPLEVEL_STATE_FULLSCREEN)
++                floating = false;
++            pstate++;
++        }
++        // anything changed?
++        if (width!=obj->_traits->width || height!=obj->_traits->height || floating!=obj->_gw.floating) {
++            obj->_gw.width = width;
++            obj->_gw.height = height;
++            obj->_gw.floating = floating;
++            // indicate config change is pending
++            obj->_gw.pending_config = true;
++            WLGWlog(0) << obj->_logname << "<xdg_toplevel_configure: " << width << "," << height << "," << floating << ">" << std::endl;
++        }
++    }
++
++public:
++    WLGraphicsWindow(osg::GraphicsContext::Traits* traits, struct gc_client_state* gc):
++        _valid(false),
++        _realized(false)
++    {
++        // generate logging name, use window name if supplied
++        if (traits->windowName.empty()) {
++            std::ostringstream buf;
++            buf << "WLgw(" << this << ')';
++            _logname = buf.str();
++        } else {
++            _logname = "WLgw(" + traits->windowName + ")";
++        }
++        WLGWlog(1) << _logname << "::<init>[" << std::endl;
++        // Fail if we're asked for a pixel buffer
++        if (traits->pbuffer) {
++            WLGWlog(-1) << _logname << ":pixel buffer surfaces not supported" << std::endl;
++            return;
++        }
++        // save pointer to shared state
++        _gw.gc = gc;
++        // populate parent object (GraphicsContext) fields: grrrr, should have been constructor args!
++        _traits = traits;
++        setState(new osg::State);
++        getState()->setGraphicsContext(this);
++        if (_traits.valid() && _traits->sharedContext.valid()) {
++                getState()->setContextID(_traits->sharedContext->getState()->getContextID());
++                incrementContextIDUsageCount(getState()->getContextID());
++        } else {
++                getState()->setContextID(osg::GraphicsContext::createNewContextID());
++        }
++        // create new surface as top level window
++        _gw.surface = wl_compositor_create_surface(_gw.gc->compositor);
++        // via an XDG surface wrapper
++        _gw.xdg_surface = xdg_wm_base_get_xdg_surface(_gw.gc->xdg_wm_base, _gw.surface);
++        _xdg_surface_listener.configure = xdg_surface_configure;
++        xdg_surface_add_listener(_gw.xdg_surface, &_xdg_surface_listener, this);
++        _gw.xdg_toplevel = xdg_surface_get_toplevel(_gw.xdg_surface);
++        _xdg_toplevel_listener.close = xdg_toplevel_close;
++        _xdg_toplevel_listener.configure = xdg_toplevel_configure;
++        xdg_toplevel_add_listener(_gw.xdg_toplevel, &_xdg_toplevel_listener, this);
++        // hint for the window manager on grouping, and allows app-specific rules to be applied
++        xdg_toplevel_set_app_id(_gw.xdg_toplevel, "org.flightgear.FlightGear");
++        // grab decoration extension for this toplevel if available
++        if (_gw.gc->zxdg_decoration_manager_v1)
++            _gw.zxdg_toplevel_decoration_v1 = zxdg_decoration_manager_v1_get_toplevel_decoration(_gw.gc->zxdg_decoration_manager_v1, _gw.xdg_toplevel);
++        // apply traits..
++        xdg_toplevel_set_title(_gw.xdg_toplevel, _traits->windowName.c_str());
++        WLGWlog(0) << _logname << "name='" << _traits->windowName << "'" << std::endl;
++        // bool windowDecoration: used to determine fullscreen or not
++        // screen ID used to select output
++        if (_traits->windowDecoration)
++            xdg_toplevel_unset_fullscreen(_gw.xdg_toplevel);
++        else
++            xdg_toplevel_set_fullscreen(_gw.xdg_toplevel, NULL);    // allow compositor to select screen
++        WLGWlog(0) << _logname << "full=" << !_traits->windowDecoration << "/screen=" << _traits->screenNum << std::endl;
++        // bool supportsResize yes, we do, no action.
++        // bool pbuffer (see above)
++        // bool quadBufferStereo - ignored?
++        // doubleBuffer - by default yes.
++        // GLenum target, format (texture output)
++        // uint level, format, mipMapGen (texture output)
++        // bool vsync - by default yes.
++        WLGWlog(0) << _logname << "vsync=" << _traits->vsync << std::endl;
++        // bool swapGroupEnabled,
++        // GLuint swapGroup, swapBarrier - ignored?
++        // bool useMultiThreadGL (MacOS only?)
++        // bool useCursor - as requested
++        _gw.cursor_surface = wl_compositor_create_surface(_gw.gc->compositor);
++        setCursor(traits->useCursor ? MouseCursor::LeftArrowCursor : MouseCursor::NoCursor);
++        // std::string glContextVersion,
++        // uint glContextFlags, glProfileMask - ignored, should check >=
++        // bool setInheritedPixelFormat - ignored?
++        // DisplaySettings::SwapMethod swapMethod - ignored?
++        // OpenThreads::Affinity affinity - ignored?
++
++        // uint red,blue,green,alpha colour bits, depth&stencil buffer depths 
++        // uint sampleBuffers, samples
++        EGLint ncfg, eglattrs[] = {
++            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++            EGL_BLUE_SIZE, (EGLint)_traits->blue,
++            EGL_GREEN_SIZE, (EGLint)_traits->green,
++            EGL_RED_SIZE, (EGLint)_traits->red,
++            EGL_ALPHA_SIZE, (EGLint)_traits->alpha,
++            EGL_DEPTH_SIZE, (EGLint)_traits->depth,
++            EGL_STENCIL_SIZE, (EGLint)_traits->stencil,
++            _traits->sampleBuffers? EGL_SAMPLE_BUFFERS : EGL_NONE, (EGLint)_traits->sampleBuffers,
++            _traits->samples? EGL_SAMPLES : EGL_NONE, (EGLint)_traits->samples,
++            EGL_NONE };
++
++        // create EGL surface for OpenGL/OSG to draw on
++        if (eglChooseConfig(_gw.gc->egl_display, eglattrs, &_gw.egl_config, 1, &ncfg) != EGL_TRUE) {
++            WLGWlog(-1) << _logname << "::checkInit: cannot choose EGL config" << std::endl;
++            return;
++        }
++        WLGWlog(0) << _logname << "depths(b/g/r/a/d/s)=(" << _traits->blue << '/' << _traits->green << '/' << _traits->red << '/'
++            << _traits->alpha << '/' << _traits->depth << '/' << _traits->stencil << ")" << std::endl;
++        if (_traits->sampleBuffers || _traits->samples) {
++            WLGWlog(0) << _logname << "msaa(b/s)=(" << _traits->sampleBuffers << '/' << _traits->samples << ")" << std::endl;
++        }
++        if (!eglBindAPI(EGL_OPENGL_API)) {
++            WLGWlog(-1) << _logname << "::checkInit: cannot bind OpenGL API" << std::endl;
++            return;
++        }
++        _gw.egl_context = eglCreateContext(_gw.gc->egl_display, _gw.egl_config, EGL_NO_CONTEXT, NULL);
++        if (EGL_NO_CONTEXT == _gw.egl_context) {
++            WLGWlog(-1) << _logname << "::checkInit: cannot create EGL context" << std::endl;
++            return;
++        }
++        _gw.egl_window = wl_egl_window_create(_gw.surface, _traits->width, _traits->height);
++        if (!_gw.egl_window) {
++            WLGWlog(-1) << _logname << ":cannot create EGL window" << std::endl;
++            return;
++        }
++        _gw.egl_surface = eglCreateWindowSurface(_gw.gc->egl_display, _gw.egl_config, _gw.egl_window, nullptr);
++        if (EGL_NO_SURFACE == _gw.egl_surface) {
++            WLGWlog(-1) << _logname << ":cannot create EGL surface" << std::endl;
++            return;
++        }
++        _valid = true;
++        // add ourselves to window map
++        gc->windows[_gw.surface] = this;
++        // indicate that we're not configured yet
++        _gw.width = _traits->width;
++        _gw.height = _traits->height;
++        _gw.pending_config = true;
++        WLGWlog(-1) << "]=valid" << std::endl;
++    }
++    virtual ~WLGraphicsWindow() {
++        WLGWlog(1) << _logname << "WLGraphicsWindow<term>[" << std::endl;
++        close(true);
++        // remove ourselves from window map
++        _gw.gc->windows.erase(_gw.surface);
++        WLGWlog(-1) << _logname << "]" << std::endl;
++    }
++    // accessor for input event system to notify a specific window of the pointer arriving..
++    void pointerEnter(wl_pointer* wl_pointer, uint32_t serial) {
++        // save state, set our cursor
++        _gw.cursor_pointer = wl_pointer;
++        _gw.cursor_serial = serial;
++        applyCursor(_gw.cursor_last);
++        WLGWlog(0) << _logname << "::pointerEnter" << std::endl;
++    }
++
++    // GraphicsWindow overrides
++    virtual const char* className() const { return "WLGraphicsWindow"; }
++    virtual bool setWindowRectangleImplementation(int x, int y, int w, int h) {
++        // not without difficulty on Wayland..
++        WLGWlog(0) << _logname << "::setWindowRectangleImplementation(" << x << "," << y << "," << w << "," << h << ")=false" << _traits.valid() << std::endl;
++        return false;
++    }
++    virtual bool setWindowDecorationImplementation(bool windowDecoration) {
++        WLGWlog(0) << _logname << "::setWindowDecorationImplementation(" << windowDecoration << ")" << std::endl;
++        // used to determine fullscreen or not - xdg_toplevel_configure will sort out size/decoration
++        if (windowDecoration)
++            xdg_toplevel_unset_fullscreen(_gw.xdg_toplevel);
++        else
++            xdg_toplevel_set_fullscreen(_gw.xdg_toplevel, NULL);    // allow compositor to select screen
++        return true;
++    }
++    virtual void grabFocus() {
++        WLGWlog(0) << _logname << "::grabFocus()" << std::endl;
++        // UNSUPPORTED in Wayland?
++    }
++    virtual void raiseWindow() {
++        WLGWlog(0) << _logname << "::raiseWindow()" << std::endl;
++        // UNSUPPORTED in Wayland?
++    }
++    virtual void setWindowName(const std::string& name) {
++        WLGWlog(0) << _logname << "::setWindowName(" << name << ")" << std::endl;
++        _traits->windowName = name;
++        _logname = "WLgw(" + name + ")";
++        xdg_toplevel_set_title(_gw.xdg_toplevel, _traits->windowName.c_str());
++    }
++    virtual void setSyncToVBlank(bool on) {
++        WLGWlog(0) << _logname << "::setSyncToVBlank(" << on << ")" << std::endl;
++        // wait for frame callback..
++        _traits->vsync = on;
++    }
++    virtual void setCursor(MouseCursor mouseCursor) {
++        WLGWlog(0) << _logname << "::setCursor(" << mouseCursor << " [" << _gw.cursor_last << "])" << std::endl;
++        // InheritCursor => put back previous cursor
++        if (MouseCursor::InheritCursor == mouseCursor)
++            mouseCursor = _gw.cursor_last;
++        applyCursor(mouseCursor);
++       // remember what was last set
++        _gw.cursor_last = mouseCursor;
++    }
++    virtual bool valid() const {
++        if (!_valid) WLGWlog(0) << _logname << "::valid()=" << _valid << std::endl;
++        return _valid;
++    }
++    virtual bool realizeImplementation() {
++        WLGWlog(1) << _logname << "::realizeImplementation()[" << std::endl;
++        while (!_realized) {
++            wl_surface_commit(_gw.surface);
++            wl_display_roundtrip(_gw.gc->display);
++            _realized = true;
++        }
++        WLGWlog(-1) << _logname << "]=" << _realized << std::endl;
++        return _realized;
++    }
++    virtual bool isRealizedImplementation() const {
++        WLGWlog(0) << _logname << "::isRealizedImplementation()=" << _realized << std::endl;
++        return _realized;
++    }
++    virtual void closeImplementation() {
++        WLGWlog(0) << _logname << "::closeImplementation()" << std::endl;
++        if (_valid) {
++            if (_gw.egl_surface != EGL_NO_SURFACE) eglDestroySurface(_gw.gc->egl_display, _gw.egl_surface);
++            if (_gw.egl_window) wl_egl_window_destroy(_gw.egl_window);
++            if (_gw.xdg_toplevel) xdg_toplevel_destroy(_gw.xdg_toplevel);
++            if (_gw.xdg_surface) xdg_surface_destroy(_gw.xdg_surface);
++            if (_gw.surface) wl_surface_destroy(_gw.surface);
++        }
++        _valid = false;
++    }
++
++    // GraphicsContext overrides
++    virtual bool makeCurrentImplementation() {
++        EGLContext curContext = eglGetCurrentContext();
++        bool rv = (curContext != _gw.egl_context) ? eglMakeCurrent(_gw.gc->egl_display, _gw.egl_surface, _gw.egl_surface, _gw.egl_context) : true;
++        //PAA:Noisy in multi-screen! WLGWlog(0) << _logname << "::makeCurrentImplementation()=" << rv << std::endl;
++        return rv;
++    }
++    virtual void swapBuffersImplementation() {
++        eglSwapBuffers(_gw.gc->egl_display, _gw.egl_surface);
++        // pump any async logic
++        checkAsyncWork();
++        // pump any Wayland messages
++        wl_display_dispatch_pending(_gw.gc->display);
++    }
++
++private:
++    void applyCursor(MouseCursor mouseCursor) {
++        // provided we have a pointer reference and a serial number.. do it!
++        if (_gw.cursor_pointer && _gw.cursor_serial) {
++            // map requested cursor to a buffer/surface
++            auto it = _gw.gc->cursors.find(mouseCursor);
++            if (it != _gw.gc->cursors.end() && it->second) {
++                wl_surface_destroy(_gw.cursor_surface);
++                _gw.cursor_surface = wl_compositor_create_surface(_gw.gc->compositor);
++                wl_surface_attach(_gw.cursor_surface, wl_cursor_image_get_buffer(it->second->images[0]), 0, 0);
++                wl_surface_commit(_gw.cursor_surface);
++                wl_pointer_set_cursor(_gw.cursor_pointer, _gw.cursor_serial, _gw.cursor_surface, 0, 0);
++            } else {
++                wl_pointer_set_cursor(_gw.cursor_pointer, _gw.cursor_serial, nullptr, 0, 0);
++            }
++        }
++    }
++};
++
++class WLWindowingSystemInterface : public osg::GraphicsContext::WindowingSystemInterface {
++
++private:
++    bool _wl_init = false;
++    struct gc_client_state _gc = {0};
++    struct wl_registry_listener _wl_registry_listener;
++    struct wl_output_listener _wl_output_listener;
++    struct wl_seat_listener _wl_seat_listener;
++    struct xdg_wm_base_listener _xdg_wm_base_listener;
++    struct wl_keyboard_listener _wl_keyboard_listener;
++    struct wl_pointer_listener _wl_pointer_listener;
++
++    // Registry object capture
++    static void registry_add(void *data, struct wl_registry *wl_registry, uint32_t name, const char *interface, uint32_t version) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        void** phandle = nullptr;
++        const wl_interface* pinterface;
++        if (strcmp(interface, wl_shm_interface.name)==0) {
++            phandle = (void**)&obj->_gc.shm; pinterface = &wl_shm_interface;
++        } else if (strcmp(interface, wl_compositor_interface.name)==0) {
++            phandle = (void**)&obj->_gc.compositor; pinterface = &wl_compositor_interface;
++        } else if (strcmp(interface, wl_seat_interface.name)==0) {
++            phandle = (void**)&obj->_gc.seat; pinterface = &wl_seat_interface;
++        } else if (strcmp(interface, wl_output_interface.name)==0) {
++            if (obj->_gc.n_outputs < MAX_OUTPUTS) {
++                phandle = (void**)&obj->_gc.output[obj->_gc.n_outputs]; pinterface = &wl_output_interface;
++                obj->_gc.n_outputs++;
++            } else {
++                OSG_WARN << "WLwsi: more than " << MAX_OUTPUTS << " outputs available, unable to track them all!" << std::endl;
++            }
++        } else if (strcmp(interface, xdg_wm_base_interface.name)==0) {
++            phandle = (void**)&obj->_gc.xdg_wm_base; pinterface = &xdg_wm_base_interface;
++        } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name)==0) {
++            phandle = (void**)&obj->_gc.zxdg_decoration_manager_v1; pinterface = &zxdg_decoration_manager_v1_interface;
++        } else if (strcmp(interface, wl_data_device_manager_interface.name)==0) {
++            phandle = (void**)&obj->_gc.data_device_manager; pinterface = &wl_data_device_manager_interface;
++        }
++        if (phandle) {
++            uint32_t minversion = (int)version < pinterface->version ? version : (uint32_t)pinterface->version;
++            *phandle = wl_registry_bind(wl_registry, name, pinterface, minversion);
++            WLGWlog(0) << "<registry bind: " << interface << '@' << minversion << ">" << std::endl;
++        }
++    }
++    static void registry_rem(void *data, struct wl_registry *wl_registry, uint32_t name) {}
++    // Output info
++    int find_output(struct wl_output* wl_output) {
++        for (int o=0; o<(int)_gc.n_outputs; o++) {
++            if (_gc.output[o]==wl_output)
++                return o;
++        }
++        return -1;
++    }
++    static void output_geometry(void *data, wl_output *wl_output, int32_t x, int32_t y, int32_t physical_width, int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int o = obj->find_output(wl_output);
++        WLGWlog(0) << "<output(" << o << ") geom(" << make << '/' << model << "): " << physical_width << 'x' << physical_height << '@' << x << ',' << y << ">" << std::endl;
++    }
++    static void output_mode(void *data, wl_output *wl_output, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
++        // retain current mode
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int o = obj->find_output(wl_output);
++        if ((WL_OUTPUT_MODE_CURRENT & flags) && o>=0) {
++            obj->_gc.output_width[o] = width;
++            obj->_gc.output_height[o] = height;
++        }
++        WLGWlog(0) << "<output(" << o << ") mode: " << width << 'x' << height << ">" << std::endl;
++    }
++    static void output_scale(void *data, wl_output *wl_output, int32_t factor) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int o = obj->find_output(wl_output);
++        WLGWlog(0) << "<output(" << o << ") scale: " << factor << ">" << std::endl;
++    }
++    static void output_done(void *data, wl_output *wl_output) {}
++    static void output_name(void *data, wl_output *wl_output, const char *name) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int o = obj->find_output(wl_output);
++        WLGWlog(0) << "<output(" << o << ") name: " << name << ">" << std::endl;
++    }
++    static void output_desc(void *data, wl_output *wl_output, const char *desc) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int o = obj->find_output(wl_output);
++        WLGWlog(0) << "<output(" << o << ") desc: " << desc << ">" << std::endl;
++    }
++    // Input handling
++    WLGraphicsWindow* get_window(struct wl_surface* surface) {
++        if (surface) {
++            auto winit = _gc.windows.find(surface);
++            if (winit != _gc.windows.end()) {
++                return winit->second;
++            }
++        }
++        return nullptr;
++    }
++    static void keyboard_enter(void* data, wl_keyboard* wl_keyboard, uint32_t serial, wl_surface* surface, wl_array* keys) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        obj->_gc.keyboard_surface = surface;
++        obj->_gc.keyboard_serial = serial;
++        WLGWlog(1) << "<keyboard enter: " << surface << ">" << std::endl;
++        // dump pressed keys
++        uint32_t* pkey = (uint32_t*)keys->data;
++        while ((char*)pkey < ((char*)keys->data+keys->size)) {
++            keyboard_key(data, wl_keyboard, serial, 0, *pkey, 1);
++            pkey++;
++        }
++        WLGWlog(-1) << "<keyboard enter: done>" << std::endl;
++    }
++    static void keyboard_leave(void* data, wl_keyboard* wl_keyboard, uint32_t serial, wl_surface* surface) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        obj->_gc.keyboard_surface = nullptr;
++        obj->_gc.keyboard_state = KEYBOARD_IDLE;
++        WLGWlog(0) << "<keyboard leave: " << surface << ">" << std::endl;
++    }
++    static void keyboard_map(void* data, wl_keyboard* wl_keyboard, uint32_t format, int32_t fd, uint32_t size) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        // we only support XKBv1
++        if (format!=WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
++            return;
++        // create a context if not already done
++        if (!obj->_gc.xkb_content)
++            obj->_gc.xkb_content = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++        // map to our memory space
++        void *xkbtext = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
++        // [re-]parse as a keymap
++        xkb_keymap_unref(obj->_gc.xkb_keymap);
++        obj->_gc.xkb_keymap = xkb_keymap_new_from_string(obj->_gc.xkb_content, (const char *)xkbtext, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
++        munmap(xkbtext, size);
++        close(fd);
++        // [re-]initialise state
++        xkb_state_unref(obj->_gc.xkb_state);
++        obj->_gc.xkb_state = xkb_state_new(obj->_gc.xkb_keymap);
++        WLGWlog(0) << "<keyboard map: format=" << format << ", fd=" << fd << ", size=" << size << ", map=" << obj->_gc.xkb_keymap << ", state=" << obj->_gc.xkb_state << ">" << std::endl;
++    }
++    static void keyboard_repeat(void* data, wl_keyboard* wl_keyboard, int32_t rate, int32_t delay) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        WLGWlog(0) << "<keyboard repeat: rate=" << rate << ", delay=" << delay << ">" << std::endl;
++        obj->_gc.keyboard_repeat = 1000/rate;
++        obj->_gc.keyboard_delay = delay;
++    }
++    static void keyboard_modifiers(void* data, wl_keyboard* wl_keyboard, uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        // update XKB with modifier state: https://wayland-book.com/seat/keyboard.html
++        xkb_state_update_mask(obj->_gc.xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
++        if (auto win = obj->get_window(obj->_gc.keyboard_surface)) {
++            // adjust currently effective modifiers
++            auto es = win->getEventQueue()->getCurrentEventState();
++            int emods = es->getModKeyMask();
++            if (xkb_state_mod_name_is_active(obj->_gc.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE))
++                emods |= osgGA::GUIEventAdapter::ModKeyMask::MODKEY_SHIFT;
++            else
++                emods &= ~osgGA::GUIEventAdapter::ModKeyMask::MODKEY_SHIFT;
++            if (xkb_state_mod_name_is_active(obj->_gc.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE))
++                emods |= osgGA::GUIEventAdapter::ModKeyMask::MODKEY_CTRL;
++            else
++                emods &= ~osgGA::GUIEventAdapter::ModKeyMask::MODKEY_CTRL;
++            if (xkb_state_mod_name_is_active(obj->_gc.xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE))
++                emods |= osgGA::GUIEventAdapter::ModKeyMask::MODKEY_ALT;
++            else
++                emods &= ~osgGA::GUIEventAdapter::ModKeyMask::MODKEY_ALT;
++            es->setModKeyMask(emods);
++            // push through a harmless key to update modifier state in event system, otherwise the joystick b0rks.. (arrrrgh!!)
++            win->getEventQueue()->keyPress(osgGA::GUIEventAdapter::KeySymbol::KEY_Shift_L);
++        }
++        WLGWlog(0) << "<keymods: " << mods_depressed << ',' << mods_latched << ',' << mods_locked << ',' << group << ">" << std::endl;
++    }
++    static void keyboard_key(void* data, wl_keyboard* wl_keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        // NB: from: https://wayland-book.com/seat/keyboard.html
++        // "Important: the scancode from this event is the Linux evdev scancode. To translate this to an XKB scancode, you must add 8 to the evdev scancode."
++        key += 8;
++        // ignore modifier keys..
++        if (!xkb_key_repeats(obj->_gc.xkb_keymap, key))
++            return;
++        // We also rely on the fact that OSG have used the /same UTF32 symbol codes/ as XKB (or so it appears)
++        xkb_keysym_t sym = xkb_state_key_get_one_sym(obj->_gc.xkb_state, key);
++        // if Ctrl is in play and we have A-Z, synthesize old ASCII values, as 'get_one_sym' above does not translate Ctrl codes..
++        if (xkb_state_mod_name_is_active(obj->_gc.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE)
++            && sym>=XKB_KEY_a && sym<=XKB_KEY_z) {
++            sym = 1 + (sym - XKB_KEY_a);
++        }
++        // find the target window..
++        if (auto win = obj->get_window(obj->_gc.keyboard_surface)) {
++            if (state)
++                win->getEventQueue()->keyPress((int)sym);
++            else
++                win->getEventQueue()->keyRelease((int)sym);
++            WLGWlog(0) << (state?"<keypress: ":"<keyrelease: ") << key << "=>" << sym << ">" << std::endl;
++        }
++        // any keypress always puts us in DELAY state for repeats, any release and we stop repeating
++        obj->_gc.keyboard_state = state ? KEYBOARD_DELAY : KEYBOARD_IDLE;
++        obj->_gc.keyboard_last = (int)sym;
++    }
++    static void pointer_enter(void *data, wl_pointer* wl_pointer, uint32_t serial, wl_surface* surface, wl_fixed_t surface_x, wl_fixed_t surface_y) {
++        WLGWlog(0) << "<pointer enter: " << surface << ">" << std::endl;
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        obj->_gc.pointer_surface = surface;
++        if (auto win = obj->get_window(surface)) {
++            win->pointerEnter(wl_pointer, serial);
++        }
++    }
++    static void pointer_leave(void* data, wl_pointer* wl_pointer, uint32_t serial, wl_surface* surface) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        obj->_gc.pointer_surface = nullptr;
++        WLGWlog(0) << "<pointer leave: " << surface << ">" << std::endl;
++    }
++    static void pointer_axis(void* data, wl_pointer* wl_pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int32_t move = (value>>8);
++        if (!move)
++            return;
++        if (auto win = obj->get_window(obj->_gc.pointer_surface)) {
++            win->getEventQueue()->mouseScroll(
++                move<0 ?
++                    WL_POINTER_AXIS_VERTICAL_SCROLL==axis ?
++                        osgGA::GUIEventAdapter::ScrollingMotion::SCROLL_UP : osgGA::GUIEventAdapter::ScrollingMotion::SCROLL_LEFT :
++                    WL_POINTER_AXIS_VERTICAL_SCROLL==axis ?
++                        osgGA::GUIEventAdapter::ScrollingMotion::SCROLL_DOWN : osgGA::GUIEventAdapter::ScrollingMotion::SCROLL_RIGHT
++            );
++            if (getenv("OSGMOUSEVERB"))
++                WLGWlog(0) << "<pointer_axis(" << axis << ',' << (value>>8) << ")>" << std::endl;
++        }
++    }
++    static void pointer_axis_discrete(void* data, wl_pointer* wl_pointer, uint32_t axis, int32_t discrete) {
++        // TODO: ignored for now (also deprecated in later protocol versions)
++        WLGWlog(0) << "<pointer_axis_discreet(" << discrete << ")>" << std::endl;
++    }
++    static void pointer_axis_source(void* data, wl_pointer* wl_pointer, uint32_t source) {
++        if (getenv("OSGMOUSEVERB"))
++            WLGWlog(0) << "<pointer_axis_source(" << source << ")>" << std::endl;
++    }
++    static void pointer_axis_stop(void* data, wl_pointer* wl_pointer, uint32_t time, uint32_t axis) {
++        if (getenv("OSGMOUSEVERB"))
++            WLGWlog(0) << "<pointer_axis_stop(" << axis << ")>" << std::endl;
++    }
++    static void pointer_motion(void* data, wl_pointer* wl_pointer, uint32_t time, wl_fixed_t surface_x, wl_fixed_t surface_y) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        if (auto win = obj->get_window(obj->_gc.pointer_surface)) {
++            osgGA::EventQueue* queue = win->getEventQueue();
++            if (getenv("OSGMOUSETX")) {
++                float minX = queue->getCurrentEventState()->getXmin();
++                float maxX = queue->getCurrentEventState()->getXmax();
++                float minY = queue->getCurrentEventState()->getYmin();
++                float maxY = queue->getCurrentEventState()->getYmax();
++                obj->_gc.pointer_x = minX + (maxX-minX)*(float)(surface_x>>8)/(float)(win->getTraits()->width);
++                obj->_gc.pointer_y = minY + (maxY-minY)*(float)(surface_y>>8)/(float)(win->getTraits()->height);
++            } else {
++                obj->_gc.pointer_x = (float)(surface_x>>8);
++                obj->_gc.pointer_y = (float)(surface_y>>8);
++            }
++            queue->mouseMotion(obj->_gc.pointer_x, obj->_gc.pointer_y);
++            if (getenv("OSGMOUSEVERB"))
++                WLGWlog(0) << "<mouse@" << (obj->_gc.pointer_x) << ',' << (obj->_gc.pointer_y) << ">" << std::endl;
++        }
++    }
++    static void pointer_button(void* data, wl_pointer* wl_pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        int mapped = BTN_LEFT==button ? 1 : BTN_MIDDLE==button ? 2 : BTN_RIGHT==button ? 3 : -1;
++        if (mapped<0)
++            return;
++        if (auto win = obj->get_window(obj->_gc.pointer_surface)) {
++            if (state)
++                win->getEventQueue()->mouseButtonPress(obj->_gc.pointer_x, obj->_gc.pointer_y, mapped);
++            else
++                win->getEventQueue()->mouseButtonRelease(obj->_gc.pointer_x, obj->_gc.pointer_y, mapped);
++            if (getenv("OSGMOUSEVERB"))
++                WLGWlog(0) << "<button: " << button << '@' << (obj->_gc.pointer_x) << ',' << (obj->_gc.pointer_y) << ',' << state << ">" << std::endl;
++        }
++    }
++    static void pointer_frame(void* data, wl_pointer* wl_pointer) {
++        if (getenv("OSGMOUSEVERB"))
++            WLGWlog(0) << "<pointer frame>" << std::endl;
++    }
++    static void seat_capabilities(void* data, wl_seat* wl_seat, uint32_t capabilities) {
++        WLWindowingSystemInterface* obj = (WLWindowingSystemInterface*) data;
++        obj->_gc.seat_caps = capabilities;
++        // clean up existing handlers
++        if (obj->_gc.keyboard) {
++            wl_keyboard_destroy(obj->_gc.keyboard);
++            obj->_gc.keyboard = nullptr;
++        }
++        if (obj->_gc.pointer) {
++            wl_pointer_destroy(obj->_gc.pointer);
++            obj->_gc.pointer = nullptr;
++        }
++        // attach new handlers
++        if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
++            obj->_gc.keyboard = wl_seat_get_keyboard(wl_seat);
++            obj->_wl_keyboard_listener.enter = keyboard_enter;
++            obj->_wl_keyboard_listener.leave = keyboard_leave;
++            obj->_wl_keyboard_listener.keymap = keyboard_map;
++            obj->_wl_keyboard_listener.modifiers = keyboard_modifiers;
++            obj->_wl_keyboard_listener.key = keyboard_key;
++            obj->_wl_keyboard_listener.repeat_info = keyboard_repeat;
++            wl_keyboard_add_listener(obj->_gc.keyboard, &obj->_wl_keyboard_listener, obj);
++        }
++        if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
++            obj->_gc.pointer = wl_seat_get_pointer(wl_seat);
++            obj->_wl_pointer_listener.enter = pointer_enter;
++            obj->_wl_pointer_listener.leave = pointer_leave;
++            obj->_wl_pointer_listener.axis = pointer_axis;
++            obj->_wl_pointer_listener.axis_discrete = pointer_axis_discrete;
++            obj->_wl_pointer_listener.axis_source = pointer_axis_source;
++            obj->_wl_pointer_listener.axis_stop = pointer_axis_stop;
++            obj->_wl_pointer_listener.motion = pointer_motion;
++            obj->_wl_pointer_listener.button = pointer_button;
++            obj->_wl_pointer_listener.frame = pointer_frame;
++            wl_pointer_add_listener(obj->_gc.pointer, &obj->_wl_pointer_listener, obj);
++        }
++        WLGWlog(0) << "<seat caps: " << capabilities << ">" << std::endl;
++    }
++    static void seat_name(void* data, wl_seat* wl_seat, const char *name) {
++        WLGWlog(0) << "<seat name: " << name << ">" << std::endl;
++    }
++    // XDG keepalive responder
++    static void xdg_ping(void *data, struct xdg_wm_base *xdg_wm_base, uint32_t serial) {
++        xdg_wm_base_pong(xdg_wm_base, serial);
++        WLGWlog(0) << "<xdg_ping>" << std::endl;
++    }
++
++    // Lazy init
++    bool checkInit() {
++        while (!_wl_init) {
++            WLGWlog(1) << "WLwsi::checkInit()[" << std::endl;
++            _gc.display = wl_display_connect(nullptr);
++            if (!_gc.display) {
++                WLGWlog(0) << "WLwsi::checkInit: no Wayland display" << std::endl;
++                break;
++            }
++            // enumerate the registry to find shared objects
++            _gc.registry = wl_display_get_registry(_gc.display);
++            _wl_registry_listener.global = registry_add;
++            _wl_registry_listener.global_remove = registry_rem;
++            wl_registry_add_listener(_gc.registry, &_wl_registry_listener, this);
++            wl_display_roundtrip(_gc.display);
++            // ensure we got all required shared objects
++            if (!_gc.compositor || !_gc.shm || _gc.n_outputs < 1 || !_gc.xdg_wm_base) {
++                WLGWlog(0) << "WLwsi::checkInit: missing one of compositor/shm/output/xdg_wm_base" << std::endl;
++                break;
++            }
++            // load default cursor theme & cursor images for each OSG cursor
++            // eventually deduced by looking at:
++            // https://www.opengl.org/resources/libraries/glut/spec3/node28.html - for OSG names and descriptions
++            // https://github.com/drizt/xcursor-viewer - to view actual cursors and match against descriptions above
++            _gc.cursor_theme = wl_cursor_theme_load(nullptr, 24, _gc.shm);
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::NoCursor] = nullptr;
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::RightArrowCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "right_ptr");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::LeftArrowCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "left_ptr");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::InfoCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "hand2");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::DestroyCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "X_cursor");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::HelpCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "question_arrow");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::CycleCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "left_ptr");    // recycle icon: no equivalent
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::SprayCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "pencil");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::WaitCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "watch");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::TextCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "xterm");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::CrosshairCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "cross");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::HandCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "grabbing");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::UpDownCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "sb_v_double_arrow");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::LeftRightCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "sb_h_double_arrow");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::TopSideCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "top_side");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::BottomSideCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "bottom_side");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::LeftSideCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "left_side");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::RightSideCursor] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "right_side");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::TopLeftCorner] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "top_left_corner");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::TopRightCorner] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "top_right_corner");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::BottomRightCorner] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "bottom_right_corner");
++            _gc.cursors[osgViewer::GraphicsWindow::MouseCursor::BottomLeftCorner] = wl_cursor_theme_get_cursor(_gc.cursor_theme, "bottom_left_corner");
++            WLGWlog(0) << "WLwsi: loaded cursor_theme: " << _gc.cursor_theme << std::endl;
++            // monitor seat capabilities if we have one..
++            if (_gc.seat) {
++                _wl_seat_listener.capabilities = seat_capabilities;
++                _wl_seat_listener.name = seat_name;
++                wl_seat_add_listener(_gc.seat, &_wl_seat_listener, this);
++            }
++            // detect output settings
++            _wl_output_listener.geometry = output_geometry;
++            _wl_output_listener.mode = output_mode;
++            _wl_output_listener.scale = output_scale;
++            _wl_output_listener.done = output_done;
++            _wl_output_listener.name = output_name;
++            _wl_output_listener.description = output_desc;
++            for (size_t o=0; o<_gc.n_outputs; o++)
++                wl_output_add_listener(_gc.output[o], &_wl_output_listener, this);
++            // attach ping responder
++            _xdg_wm_base_listener.ping = xdg_ping;
++            xdg_wm_base_add_listener(_gc.xdg_wm_base, &_xdg_wm_base_listener, this);
++
++            // connect EGL
++            _gc.egl_display = eglGetDisplay(_gc.display);
++            if (EGL_NO_DISPLAY == _gc.egl_display) {
++                WLGWlog(0) << "WLwsi::checkInit: no EGL display" << std::endl;
++                break;
++            }
++            EGLint maj, min;
++            if (eglInitialize(_gc.egl_display, &maj, &min) != EGL_TRUE) {
++                WLGWlog(0) << "WLwsi::checkInit: cannot initialize EGL" << std::endl;
++                break;
++            }
++            WLGWlog(0) << "WLwsi: EGL version: " << maj << "." << min << std::endl;
++            // process any outstanding events
++            wl_display_roundtrip(_gc.display);
++            _wl_init = true;
++            WLGWlog(-1) << "]=true" << std::endl;
++        }
++        if (!_wl_init)
++            WLGWlog(-1) << "]=false" << std::endl;
++        return _wl_init;
++    }
++
++public:
++    WLWindowingSystemInterface() : _wl_init(false) {
++        WLGWlog(0) << "WLWindowingSystemInterface<init>" << std::endl;
++    }
++    virtual unsigned int getNumScreens(const osg::GraphicsContext::ScreenIdentifier& si) {
++        WLGWlog(1) << "WLwsi:getNumScreens(...)[" << std::endl;
++        unsigned int rv = checkInit() ? _gc.n_outputs : 0;
++        WLGWlog(-1) << "]=" << rv << std::endl;
++        return rv;
++    }
++    virtual void getScreenSettings(const osg::GraphicsContext::ScreenIdentifier& si, osg::GraphicsContext::ScreenSettings& resolution) {
++        WLGWlog(1) << "WLwsi:getScreenSettings(" << si.screenNum << ")[" << std::endl;
++        if (!checkInit()) {
++            WLGWlog(-1) << "]=failed" << std::endl;
++            return;
++        }
++        // sanity check screenNum :)
++        int screen = si.screenNum;
++        if (si.screenNum<0 || si.screenNum >= (int)_gc.n_outputs) {
++            OSG_WARN << "WLwsi: getScreenSettings: requested screen number (" << si.screenNum << ") out of range (0-" << (_gc.n_outputs-1) << "), using 0" << std::endl;
++            screen = 0;
++        }
++        resolution.width = _gc.output_width[screen];
++        resolution.height = _gc.output_height[screen];
++        resolution.refreshRate = 0;
++        resolution.colorDepth = 0;
++        WLGWlog(-1) << "]=" << resolution.width << 'x' << resolution.height << std::endl;
++    }
++    virtual void enumerateScreenSettings(const osg::GraphicsContext::ScreenIdentifier& si, osg::GraphicsContext::ScreenSettingsList& resList) {
++        WLGWlog(1) << "WLwsi:enumerateScreenSettings[" << std::endl;
++        if (!checkInit()) {
++            OSG_INFO << "]=failed" << std::endl;
++            return;
++        }
++        for (int screen=0; screen<(int)_gc.n_outputs; screen++) {
++            osg::GraphicsContext::ScreenIdentifier next(screen);
++            osg::GraphicsContext::ScreenSettings s;
++            getScreenSettings(si, s);
++            resList.push_back(s);
++        }
++        WLGWlog(-1) << "]=1" << std::endl;
++    }
++    virtual osg::GraphicsContext* createGraphicsContext(osg::GraphicsContext::Traits* traits) {
++        WLGWlog(1) << "WLwsi:createGraphicsContext[" << std::endl;
++        if (!checkInit()) {
++            WLGWlog(-1) << "]=failed" << std::endl;
++            return nullptr;
++        }
++        osg::ref_ptr<WLGraphicsWindow> toplevel = new WLGraphicsWindow(traits, &_gc);
++        WLGraphicsWindow* rv = nullptr;
++        if (toplevel->valid()) {
++            rv = toplevel.release();
++        }
++        WLGWlog(-1) << "]=" << rv << std::endl;
++        return rv;
++    }
++    // Accessor for the wl_display
++    struct wl_display* getDisplay() {
++        WLGWlog(1) << "WLwsi:getDisplay[" << std::endl;
++        if (!checkInit()) {
++            WLGWlog(-1) << "]=failed" << std::endl;
++            return nullptr;
++        }
++        WLGWlog(-1) << "]=" << _gc.display << std::endl;
++        return _gc.display;
++    }
++    // Accessors for a wl_data_device & wl_data_source, so we can implement a clipboard handler elsewhere.
++    struct wl_data_device* getDataDevice() {
++        WLGWlog(1) << "WLwsi:getDataDevice[" << std::endl;
++        if (!checkInit()) {
++            WLGWlog(-1) << "]=failed" << std::endl;
++            return nullptr;
++        }
++        // check we have a data device manager and a seat..
++        if (!_gc.seat || !_gc.data_device_manager) {
++            WLGWlog(-1) << "]=no seat/data_device_manager" << std::endl;
++            return nullptr;
++        }
++        struct wl_data_device* rv = wl_data_device_manager_get_data_device(_gc.data_device_manager, _gc.seat);
++        WLGWlog(-1) << "]=" << rv << std::endl;
++        return rv;
++    }
++    struct wl_data_source* getDataSource() {
++        WLGWlog(1) << "WLwsi:getDataSource[" << std::endl;
++        if (!checkInit()) {
++            WLGWlog(-1) << "]=failed" << std::endl;
++            return nullptr;
++        }
++        // check we have a data device manager..
++        if (!_gc.data_device_manager) {
++            WLGWlog(-1) << "]=data_device_manager" << std::endl;
++            return nullptr;
++        }
++        struct wl_data_source* rv = wl_data_device_manager_create_data_source(_gc.data_device_manager);
++        WLGWlog(-1) << "]=" << rv << std::endl;
++        return rv;
++    }
++    uint32_t getLastKeySerial() {
++        return _gc.keyboard_serial;
++    }
++
++    // async work pump
++    void checkAsyncWork(void) {
++        // keyboard repeat?
++        if (KEYBOARD_IDLE==_gc.keyboard_state) {
++            // while idle, record current tick..
++            _gc.keyboard_tick = tickMs();
++        } else if (KEYBOARD_DELAY==_gc.keyboard_state) {
++            // while in delay, wait for specified time
++            uint64_t now = tickMs();
++            if (now>_gc.keyboard_tick+(uint64_t)_gc.keyboard_delay) {
++                // start repeating from now
++                _gc.keyboard_state = KEYBOARD_REPEAT;
++                _gc.keyboard_tick = now;
++            }
++        } else {
++            // while in repeat, time to issue another repeat?
++            uint64_t now = tickMs();
++            if (now>_gc.keyboard_tick+(uint64_t)_gc.keyboard_repeat) {
++                // yep - send release then press events
++                auto win = get_window(_gc.keyboard_surface);
++                win->getEventQueue()->keyRelease(_gc.keyboard_last);
++                win->getEventQueue()->keyPress(_gc.keyboard_last);
++                _gc.keyboard_tick = now;
++                WLGWlog(0) << "<keyboard repeat: " << _gc.keyboard_last << ">" << std::endl;
++            }
++        }
++    }
++
++private:
++    uint64_t tickMs(void) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        return (ts.tv_sec * 1000)+(ts.tv_nsec/1000000);
++    }
++};
++
++// statically register our new windowing system at run-time
++REGISTER_WINDOWINGSYSTEMINTERFACE(Wayland, WLWindowingSystemInterface)
++
++// close namespace
++    }
++}
++
++// accessor "C" functions for implementing a clipboard..
++struct wl_data_device* getWaylandDataDevice() {
++    com::ashbysoft::WLWindowingSystemInterface* wsi = com::ashbysoft::s_proxy_WLWindowingSystemInterface._wsi.get();
++    return wsi ? wsi->getDataDevice() : nullptr;
++}
++struct wl_data_source* getWaylandDataSource() {
++    com::ashbysoft::WLWindowingSystemInterface* wsi = com::ashbysoft::s_proxy_WLWindowingSystemInterface._wsi.get();
++    return wsi ? wsi->getDataSource() : nullptr;
++}
++uint32_t getWaylandLastKeySerial() {
++    com::ashbysoft::WLWindowingSystemInterface* wsi = com::ashbysoft::s_proxy_WLWindowingSystemInterface._wsi.get();
++    return wsi ? wsi->getLastKeySerial() : 0;
++}
++void checkAsyncWork() {
++    com::ashbysoft::WLWindowingSystemInterface* wsi = com::ashbysoft::s_proxy_WLWindowingSystemInterface._wsi.get();
++    if (wsi) wsi->checkAsyncWork();
++}
++struct wl_display* getWaylandDisplay() {
++    com::ashbysoft::WLWindowingSystemInterface* wsi = com::ashbysoft::s_proxy_WLWindowingSystemInterface._wsi.get();
++    return wsi ? wsi->getDisplay() : nullptr;
++}
+diff --git a/src/osgViewer/GraphicsWindowWayland.h b/src/osgViewer/GraphicsWindowWayland.h
+new file mode 100644
+index 000000000..5d9e0e629
+--- /dev/null
++++ b/src/osgViewer/GraphicsWindowWayland.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <wayland-client.h>
++
++// declare our function for accessing a data_device from the Wayland connection
++#ifdef __cplusplus
++extern "C" {
++#endif
++    struct wl_data_device* getWaylandDataDevice();
++    struct wl_data_source* getWaylandDataSource();
++    uint32_t getWaylandLastKeySerial();
++    void checkAsyncWork();
++    struct wl_display* getWaylandDisplay();
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/osgViewer/xdg-decoration-unstable-v1.c b/src/osgViewer/xdg-decoration-unstable-v1.c
+new file mode 100644
+index 000000000..e95c405c5
+--- /dev/null
++++ b/src/osgViewer/xdg-decoration-unstable-v1.c
+@@ -0,0 +1,65 @@
++/* Generated by wayland-scanner 1.18.0 */
++
++/*
++ * Copyright © 2018 Simon Ser
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#include <stdlib.h>
++#include <stdint.h>
++#include "wayland-util.h"
++
++extern const struct wl_interface xdg_toplevel_interface;
++extern const struct wl_interface zxdg_toplevel_decoration_v1_interface;
++
++static const struct wl_interface *xdg_decoration_unstable_v1_types[] = {
++	NULL,
++	&zxdg_toplevel_decoration_v1_interface,
++	&xdg_toplevel_interface,
++};
++
++static const struct wl_message zxdg_decoration_manager_v1_requests[] = {
++	{ "destroy", "", xdg_decoration_unstable_v1_types + 0 },
++	{ "get_toplevel_decoration", "no", xdg_decoration_unstable_v1_types + 1 },
++};
++
++WL_EXPORT const struct wl_interface zxdg_decoration_manager_v1_interface = {
++	"zxdg_decoration_manager_v1", 1,
++	2, zxdg_decoration_manager_v1_requests,
++	0, NULL,
++};
++
++static const struct wl_message zxdg_toplevel_decoration_v1_requests[] = {
++	{ "destroy", "", xdg_decoration_unstable_v1_types + 0 },
++	{ "set_mode", "u", xdg_decoration_unstable_v1_types + 0 },
++	{ "unset_mode", "", xdg_decoration_unstable_v1_types + 0 },
++};
++
++static const struct wl_message zxdg_toplevel_decoration_v1_events[] = {
++	{ "configure", "u", xdg_decoration_unstable_v1_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface zxdg_toplevel_decoration_v1_interface = {
++	"zxdg_toplevel_decoration_v1", 1,
++	3, zxdg_toplevel_decoration_v1_requests,
++	1, zxdg_toplevel_decoration_v1_events,
++};
++
+diff --git a/src/osgViewer/xdg-decoration-unstable-v1.h b/src/osgViewer/xdg-decoration-unstable-v1.h
+new file mode 100644
+index 000000000..a2eebd727
+--- /dev/null
++++ b/src/osgViewer/xdg-decoration-unstable-v1.h
+@@ -0,0 +1,376 @@
++/* Generated by wayland-scanner 1.18.0 */
++
++#ifndef XDG_DECORATION_UNSTABLE_V1_CLIENT_PROTOCOL_H
++#define XDG_DECORATION_UNSTABLE_V1_CLIENT_PROTOCOL_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include "wayland-client.h"
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @page page_xdg_decoration_unstable_v1 The xdg_decoration_unstable_v1 protocol
++ * @section page_ifaces_xdg_decoration_unstable_v1 Interfaces
++ * - @subpage page_iface_zxdg_decoration_manager_v1 - window decoration manager
++ * - @subpage page_iface_zxdg_toplevel_decoration_v1 - decoration object for a toplevel surface
++ * @section page_copyright_xdg_decoration_unstable_v1 Copyright
++ * <pre>
++ *
++ * Copyright © 2018 Simon Ser
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ * </pre>
++ */
++struct xdg_toplevel;
++struct zxdg_decoration_manager_v1;
++struct zxdg_toplevel_decoration_v1;
++
++/**
++ * @page page_iface_zxdg_decoration_manager_v1 zxdg_decoration_manager_v1
++ * @section page_iface_zxdg_decoration_manager_v1_desc Description
++ *
++ * This interface allows a compositor to announce support for server-side
++ * decorations.
++ *
++ * A window decoration is a set of window controls as deemed appropriate by
++ * the party managing them, such as user interface components used to move,
++ * resize and change a window's state.
++ *
++ * A client can use this protocol to request being decorated by a supporting
++ * compositor.
++ *
++ * If compositor and client do not negotiate the use of a server-side
++ * decoration using this protocol, clients continue to self-decorate as they
++ * see fit.
++ *
++ * Warning! The protocol described in this file is experimental and
++ * backward incompatible changes may be made. Backward compatible changes
++ * may be added together with the corresponding interface version bump.
++ * Backward incompatible changes are done by bumping the version number in
++ * the protocol and interface names and resetting the interface version.
++ * Once the protocol is to be declared stable, the 'z' prefix and the
++ * version number in the protocol and interface names are removed and the
++ * interface version number is reset.
++ * @section page_iface_zxdg_decoration_manager_v1_api API
++ * See @ref iface_zxdg_decoration_manager_v1.
++ */
++/**
++ * @defgroup iface_zxdg_decoration_manager_v1 The zxdg_decoration_manager_v1 interface
++ *
++ * This interface allows a compositor to announce support for server-side
++ * decorations.
++ *
++ * A window decoration is a set of window controls as deemed appropriate by
++ * the party managing them, such as user interface components used to move,
++ * resize and change a window's state.
++ *
++ * A client can use this protocol to request being decorated by a supporting
++ * compositor.
++ *
++ * If compositor and client do not negotiate the use of a server-side
++ * decoration using this protocol, clients continue to self-decorate as they
++ * see fit.
++ *
++ * Warning! The protocol described in this file is experimental and
++ * backward incompatible changes may be made. Backward compatible changes
++ * may be added together with the corresponding interface version bump.
++ * Backward incompatible changes are done by bumping the version number in
++ * the protocol and interface names and resetting the interface version.
++ * Once the protocol is to be declared stable, the 'z' prefix and the
++ * version number in the protocol and interface names are removed and the
++ * interface version number is reset.
++ */
++extern const struct wl_interface zxdg_decoration_manager_v1_interface;
++/**
++ * @page page_iface_zxdg_toplevel_decoration_v1 zxdg_toplevel_decoration_v1
++ * @section page_iface_zxdg_toplevel_decoration_v1_desc Description
++ *
++ * The decoration object allows the compositor to toggle server-side window
++ * decorations for a toplevel surface. The client can request to switch to
++ * another mode.
++ *
++ * The xdg_toplevel_decoration object must be destroyed before its
++ * xdg_toplevel.
++ * @section page_iface_zxdg_toplevel_decoration_v1_api API
++ * See @ref iface_zxdg_toplevel_decoration_v1.
++ */
++/**
++ * @defgroup iface_zxdg_toplevel_decoration_v1 The zxdg_toplevel_decoration_v1 interface
++ *
++ * The decoration object allows the compositor to toggle server-side window
++ * decorations for a toplevel surface. The client can request to switch to
++ * another mode.
++ *
++ * The xdg_toplevel_decoration object must be destroyed before its
++ * xdg_toplevel.
++ */
++extern const struct wl_interface zxdg_toplevel_decoration_v1_interface;
++
++#define ZXDG_DECORATION_MANAGER_V1_DESTROY 0
++#define ZXDG_DECORATION_MANAGER_V1_GET_TOPLEVEL_DECORATION 1
++
++
++/**
++ * @ingroup iface_zxdg_decoration_manager_v1
++ */
++#define ZXDG_DECORATION_MANAGER_V1_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_zxdg_decoration_manager_v1
++ */
++#define ZXDG_DECORATION_MANAGER_V1_GET_TOPLEVEL_DECORATION_SINCE_VERSION 1
++
++/** @ingroup iface_zxdg_decoration_manager_v1 */
++static inline void
++zxdg_decoration_manager_v1_set_user_data(struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zxdg_decoration_manager_v1, user_data);
++}
++
++/** @ingroup iface_zxdg_decoration_manager_v1 */
++static inline void *
++zxdg_decoration_manager_v1_get_user_data(struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zxdg_decoration_manager_v1);
++}
++
++static inline uint32_t
++zxdg_decoration_manager_v1_get_version(struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zxdg_decoration_manager_v1);
++}
++
++/**
++ * @ingroup iface_zxdg_decoration_manager_v1
++ *
++ * Destroy the decoration manager. This doesn't destroy objects created
++ * with the manager.
++ */
++static inline void
++zxdg_decoration_manager_v1_destroy(struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1)
++{
++	wl_proxy_marshal((struct wl_proxy *) zxdg_decoration_manager_v1,
++			 ZXDG_DECORATION_MANAGER_V1_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) zxdg_decoration_manager_v1);
++}
++
++/**
++ * @ingroup iface_zxdg_decoration_manager_v1
++ *
++ * Create a new decoration object associated with the given toplevel.
++ *
++ * Creating an xdg_toplevel_decoration from an xdg_toplevel which has a
++ * buffer attached or committed is a client error, and any attempts by a
++ * client to attach or manipulate a buffer prior to the first
++ * xdg_toplevel_decoration.configure event must also be treated as
++ * errors.
++ */
++static inline struct zxdg_toplevel_decoration_v1 *
++zxdg_decoration_manager_v1_get_toplevel_decoration(struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1, struct xdg_toplevel *toplevel)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_constructor((struct wl_proxy *) zxdg_decoration_manager_v1,
++			 ZXDG_DECORATION_MANAGER_V1_GET_TOPLEVEL_DECORATION, &zxdg_toplevel_decoration_v1_interface, NULL, toplevel);
++
++	return (struct zxdg_toplevel_decoration_v1 *) id;
++}
++
++#ifndef ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ENUM
++#define ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ENUM
++enum zxdg_toplevel_decoration_v1_error {
++	/**
++	 * xdg_toplevel has a buffer attached before configure
++	 */
++	ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER = 0,
++	/**
++	 * xdg_toplevel already has a decoration object
++	 */
++	ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ALREADY_CONSTRUCTED = 1,
++	/**
++	 * xdg_toplevel destroyed before the decoration object
++	 */
++	ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ORPHANED = 2,
++};
++#endif /* ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ENUM */
++
++#ifndef ZXDG_TOPLEVEL_DECORATION_V1_MODE_ENUM
++#define ZXDG_TOPLEVEL_DECORATION_V1_MODE_ENUM
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ * window decoration modes
++ *
++ * These values describe window decoration modes.
++ */
++enum zxdg_toplevel_decoration_v1_mode {
++	/**
++	 * no server-side window decoration
++	 */
++	ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE = 1,
++	/**
++	 * server-side window decoration
++	 */
++	ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE = 2,
++};
++#endif /* ZXDG_TOPLEVEL_DECORATION_V1_MODE_ENUM */
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ * @struct zxdg_toplevel_decoration_v1_listener
++ */
++struct zxdg_toplevel_decoration_v1_listener {
++	/**
++	 * suggest a surface change
++	 *
++	 * The configure event asks the client to change its decoration
++	 * mode. The configured state should not be applied immediately.
++	 * Clients must send an ack_configure in response to this event.
++	 * See xdg_surface.configure and xdg_surface.ack_configure for
++	 * details.
++	 *
++	 * A configure event can be sent at any time. The specified mode
++	 * must be obeyed by the client.
++	 * @param mode the decoration mode
++	 */
++	void (*configure)(void *data,
++			  struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1,
++			  uint32_t mode);
++};
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ */
++static inline int
++zxdg_toplevel_decoration_v1_add_listener(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1,
++					 const struct zxdg_toplevel_decoration_v1_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) zxdg_toplevel_decoration_v1,
++				     (void (**)(void)) listener, data);
++}
++
++#define ZXDG_TOPLEVEL_DECORATION_V1_DESTROY 0
++#define ZXDG_TOPLEVEL_DECORATION_V1_SET_MODE 1
++#define ZXDG_TOPLEVEL_DECORATION_V1_UNSET_MODE 2
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ */
++#define ZXDG_TOPLEVEL_DECORATION_V1_CONFIGURE_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ */
++#define ZXDG_TOPLEVEL_DECORATION_V1_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ */
++#define ZXDG_TOPLEVEL_DECORATION_V1_SET_MODE_SINCE_VERSION 1
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ */
++#define ZXDG_TOPLEVEL_DECORATION_V1_UNSET_MODE_SINCE_VERSION 1
++
++/** @ingroup iface_zxdg_toplevel_decoration_v1 */
++static inline void
++zxdg_toplevel_decoration_v1_set_user_data(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) zxdg_toplevel_decoration_v1, user_data);
++}
++
++/** @ingroup iface_zxdg_toplevel_decoration_v1 */
++static inline void *
++zxdg_toplevel_decoration_v1_get_user_data(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) zxdg_toplevel_decoration_v1);
++}
++
++static inline uint32_t
++zxdg_toplevel_decoration_v1_get_version(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1)
++{
++	return wl_proxy_get_version((struct wl_proxy *) zxdg_toplevel_decoration_v1);
++}
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ *
++ * Switch back to a mode without any server-side decorations at the next
++ * commit.
++ */
++static inline void
++zxdg_toplevel_decoration_v1_destroy(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1)
++{
++	wl_proxy_marshal((struct wl_proxy *) zxdg_toplevel_decoration_v1,
++			 ZXDG_TOPLEVEL_DECORATION_V1_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) zxdg_toplevel_decoration_v1);
++}
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ *
++ * Set the toplevel surface decoration mode. This informs the compositor
++ * that the client prefers the provided decoration mode.
++ *
++ * After requesting a decoration mode, the compositor will respond by
++ * emitting a xdg_surface.configure event. The client should then update
++ * its content, drawing it without decorations if the received mode is
++ * server-side decorations. The client must also acknowledge the configure
++ * when committing the new content (see xdg_surface.ack_configure).
++ *
++ * The compositor can decide not to use the client's mode and enforce a
++ * different mode instead.
++ *
++ * Clients whose decoration mode depend on the xdg_toplevel state may send
++ * a set_mode request in response to a xdg_surface.configure event and wait
++ * for the next xdg_surface.configure event to prevent unwanted state.
++ * Such clients are responsible for preventing configure loops and must
++ * make sure not to send multiple successive set_mode requests with the
++ * same decoration mode.
++ */
++static inline void
++zxdg_toplevel_decoration_v1_set_mode(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1, uint32_t mode)
++{
++	wl_proxy_marshal((struct wl_proxy *) zxdg_toplevel_decoration_v1,
++			 ZXDG_TOPLEVEL_DECORATION_V1_SET_MODE, mode);
++}
++
++/**
++ * @ingroup iface_zxdg_toplevel_decoration_v1
++ *
++ * Unset the toplevel surface decoration mode. This informs the compositor
++ * that the client doesn't prefer a particular decoration mode.
++ *
++ * This request has the same semantics as set_mode.
++ */
++static inline void
++zxdg_toplevel_decoration_v1_unset_mode(struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1)
++{
++	wl_proxy_marshal((struct wl_proxy *) zxdg_toplevel_decoration_v1,
++			 ZXDG_TOPLEVEL_DECORATION_V1_UNSET_MODE);
++}
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/osgViewer/xdg-shell.c b/src/osgViewer/xdg-shell.c
+new file mode 100644
+index 000000000..058ba7697
+--- /dev/null
++++ b/src/osgViewer/xdg-shell.c
+@@ -0,0 +1,171 @@
++/* Generated by wayland-scanner 1.18.0 */
++
++/*
++ * Copyright © 2008-2013 Kristian Høgsberg
++ * Copyright © 2013      Rafael Antognolli
++ * Copyright © 2013      Jasper St. Pierre
++ * Copyright © 2010-2013 Intel Corporation
++ * Copyright © 2015-2017 Samsung Electronics Co., Ltd
++ * Copyright © 2015-2017 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#include <stdlib.h>
++#include <stdint.h>
++#include "wayland-util.h"
++
++extern const struct wl_interface wl_output_interface;
++extern const struct wl_interface wl_seat_interface;
++extern const struct wl_interface wl_surface_interface;
++extern const struct wl_interface xdg_popup_interface;
++extern const struct wl_interface xdg_positioner_interface;
++extern const struct wl_interface xdg_surface_interface;
++extern const struct wl_interface xdg_toplevel_interface;
++
++static const struct wl_interface *xdg_shell_types[] = {
++	NULL,
++	NULL,
++	NULL,
++	NULL,
++	&xdg_positioner_interface,
++	&xdg_surface_interface,
++	&wl_surface_interface,
++	&xdg_toplevel_interface,
++	&xdg_popup_interface,
++	&xdg_surface_interface,
++	&xdg_positioner_interface,
++	&xdg_toplevel_interface,
++	&wl_seat_interface,
++	NULL,
++	NULL,
++	NULL,
++	&wl_seat_interface,
++	NULL,
++	&wl_seat_interface,
++	NULL,
++	NULL,
++	&wl_output_interface,
++	&wl_seat_interface,
++	NULL,
++	&xdg_positioner_interface,
++	NULL,
++};
++
++static const struct wl_message xdg_wm_base_requests[] = {
++	{ "destroy", "", xdg_shell_types + 0 },
++	{ "create_positioner", "n", xdg_shell_types + 4 },
++	{ "get_xdg_surface", "no", xdg_shell_types + 5 },
++	{ "pong", "u", xdg_shell_types + 0 },
++};
++
++static const struct wl_message xdg_wm_base_events[] = {
++	{ "ping", "u", xdg_shell_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface xdg_wm_base_interface = {
++	"xdg_wm_base", 3,
++	4, xdg_wm_base_requests,
++	1, xdg_wm_base_events,
++};
++
++static const struct wl_message xdg_positioner_requests[] = {
++	{ "destroy", "", xdg_shell_types + 0 },
++	{ "set_size", "ii", xdg_shell_types + 0 },
++	{ "set_anchor_rect", "iiii", xdg_shell_types + 0 },
++	{ "set_anchor", "u", xdg_shell_types + 0 },
++	{ "set_gravity", "u", xdg_shell_types + 0 },
++	{ "set_constraint_adjustment", "u", xdg_shell_types + 0 },
++	{ "set_offset", "ii", xdg_shell_types + 0 },
++	{ "set_reactive", "3", xdg_shell_types + 0 },
++	{ "set_parent_size", "3ii", xdg_shell_types + 0 },
++	{ "set_parent_configure", "3u", xdg_shell_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface xdg_positioner_interface = {
++	"xdg_positioner", 3,
++	10, xdg_positioner_requests,
++	0, NULL,
++};
++
++static const struct wl_message xdg_surface_requests[] = {
++	{ "destroy", "", xdg_shell_types + 0 },
++	{ "get_toplevel", "n", xdg_shell_types + 7 },
++	{ "get_popup", "n?oo", xdg_shell_types + 8 },
++	{ "set_window_geometry", "iiii", xdg_shell_types + 0 },
++	{ "ack_configure", "u", xdg_shell_types + 0 },
++};
++
++static const struct wl_message xdg_surface_events[] = {
++	{ "configure", "u", xdg_shell_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface xdg_surface_interface = {
++	"xdg_surface", 3,
++	5, xdg_surface_requests,
++	1, xdg_surface_events,
++};
++
++static const struct wl_message xdg_toplevel_requests[] = {
++	{ "destroy", "", xdg_shell_types + 0 },
++	{ "set_parent", "?o", xdg_shell_types + 11 },
++	{ "set_title", "s", xdg_shell_types + 0 },
++	{ "set_app_id", "s", xdg_shell_types + 0 },
++	{ "show_window_menu", "ouii", xdg_shell_types + 12 },
++	{ "move", "ou", xdg_shell_types + 16 },
++	{ "resize", "ouu", xdg_shell_types + 18 },
++	{ "set_max_size", "ii", xdg_shell_types + 0 },
++	{ "set_min_size", "ii", xdg_shell_types + 0 },
++	{ "set_maximized", "", xdg_shell_types + 0 },
++	{ "unset_maximized", "", xdg_shell_types + 0 },
++	{ "set_fullscreen", "?o", xdg_shell_types + 21 },
++	{ "unset_fullscreen", "", xdg_shell_types + 0 },
++	{ "set_minimized", "", xdg_shell_types + 0 },
++};
++
++static const struct wl_message xdg_toplevel_events[] = {
++	{ "configure", "iia", xdg_shell_types + 0 },
++	{ "close", "", xdg_shell_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface xdg_toplevel_interface = {
++	"xdg_toplevel", 3,
++	14, xdg_toplevel_requests,
++	2, xdg_toplevel_events,
++};
++
++static const struct wl_message xdg_popup_requests[] = {
++	{ "destroy", "", xdg_shell_types + 0 },
++	{ "grab", "ou", xdg_shell_types + 22 },
++	{ "reposition", "3ou", xdg_shell_types + 24 },
++};
++
++static const struct wl_message xdg_popup_events[] = {
++	{ "configure", "iiii", xdg_shell_types + 0 },
++	{ "popup_done", "", xdg_shell_types + 0 },
++	{ "repositioned", "3u", xdg_shell_types + 0 },
++};
++
++WL_EXPORT const struct wl_interface xdg_popup_interface = {
++	"xdg_popup", 3,
++	3, xdg_popup_requests,
++	3, xdg_popup_events,
++};
++
+diff --git a/src/osgViewer/xdg-shell.h b/src/osgViewer/xdg-shell.h
+new file mode 100644
+index 000000000..6e8036759
+--- /dev/null
++++ b/src/osgViewer/xdg-shell.h
+@@ -0,0 +1,1970 @@
++/* Generated by wayland-scanner 1.18.0 */
++
++#ifndef XDG_SHELL_CLIENT_PROTOCOL_H
++#define XDG_SHELL_CLIENT_PROTOCOL_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include "wayland-client.h"
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @page page_xdg_shell The xdg_shell protocol
++ * @section page_ifaces_xdg_shell Interfaces
++ * - @subpage page_iface_xdg_wm_base - create desktop-style surfaces
++ * - @subpage page_iface_xdg_positioner - child surface positioner
++ * - @subpage page_iface_xdg_surface - desktop user interface surface base interface
++ * - @subpage page_iface_xdg_toplevel - toplevel surface
++ * - @subpage page_iface_xdg_popup - short-lived, popup surfaces for menus
++ * @section page_copyright_xdg_shell Copyright
++ * <pre>
++ *
++ * Copyright © 2008-2013 Kristian Høgsberg
++ * Copyright © 2013      Rafael Antognolli
++ * Copyright © 2013      Jasper St. Pierre
++ * Copyright © 2010-2013 Intel Corporation
++ * Copyright © 2015-2017 Samsung Electronics Co., Ltd
++ * Copyright © 2015-2017 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ * </pre>
++ */
++struct wl_output;
++struct wl_seat;
++struct wl_surface;
++struct xdg_popup;
++struct xdg_positioner;
++struct xdg_surface;
++struct xdg_toplevel;
++struct xdg_wm_base;
++
++/**
++ * @page page_iface_xdg_wm_base xdg_wm_base
++ * @section page_iface_xdg_wm_base_desc Description
++ *
++ * The xdg_wm_base interface is exposed as a global object enabling clients
++ * to turn their wl_surfaces into windows in a desktop environment. It
++ * defines the basic functionality needed for clients and the compositor to
++ * create windows that can be dragged, resized, maximized, etc, as well as
++ * creating transient windows such as popup menus.
++ * @section page_iface_xdg_wm_base_api API
++ * See @ref iface_xdg_wm_base.
++ */
++/**
++ * @defgroup iface_xdg_wm_base The xdg_wm_base interface
++ *
++ * The xdg_wm_base interface is exposed as a global object enabling clients
++ * to turn their wl_surfaces into windows in a desktop environment. It
++ * defines the basic functionality needed for clients and the compositor to
++ * create windows that can be dragged, resized, maximized, etc, as well as
++ * creating transient windows such as popup menus.
++ */
++extern const struct wl_interface xdg_wm_base_interface;
++/**
++ * @page page_iface_xdg_positioner xdg_positioner
++ * @section page_iface_xdg_positioner_desc Description
++ *
++ * The xdg_positioner provides a collection of rules for the placement of a
++ * child surface relative to a parent surface. Rules can be defined to ensure
++ * the child surface remains within the visible area's borders, and to
++ * specify how the child surface changes its position, such as sliding along
++ * an axis, or flipping around a rectangle. These positioner-created rules are
++ * constrained by the requirement that a child surface must intersect with or
++ * be at least partially adjacent to its parent surface.
++ *
++ * See the various requests for details about possible rules.
++ *
++ * At the time of the request, the compositor makes a copy of the rules
++ * specified by the xdg_positioner. Thus, after the request is complete the
++ * xdg_positioner object can be destroyed or reused; further changes to the
++ * object will have no effect on previous usages.
++ *
++ * For an xdg_positioner object to be considered complete, it must have a
++ * non-zero size set by set_size, and a non-zero anchor rectangle set by
++ * set_anchor_rect. Passing an incomplete xdg_positioner object when
++ * positioning a surface raises an error.
++ * @section page_iface_xdg_positioner_api API
++ * See @ref iface_xdg_positioner.
++ */
++/**
++ * @defgroup iface_xdg_positioner The xdg_positioner interface
++ *
++ * The xdg_positioner provides a collection of rules for the placement of a
++ * child surface relative to a parent surface. Rules can be defined to ensure
++ * the child surface remains within the visible area's borders, and to
++ * specify how the child surface changes its position, such as sliding along
++ * an axis, or flipping around a rectangle. These positioner-created rules are
++ * constrained by the requirement that a child surface must intersect with or
++ * be at least partially adjacent to its parent surface.
++ *
++ * See the various requests for details about possible rules.
++ *
++ * At the time of the request, the compositor makes a copy of the rules
++ * specified by the xdg_positioner. Thus, after the request is complete the
++ * xdg_positioner object can be destroyed or reused; further changes to the
++ * object will have no effect on previous usages.
++ *
++ * For an xdg_positioner object to be considered complete, it must have a
++ * non-zero size set by set_size, and a non-zero anchor rectangle set by
++ * set_anchor_rect. Passing an incomplete xdg_positioner object when
++ * positioning a surface raises an error.
++ */
++extern const struct wl_interface xdg_positioner_interface;
++/**
++ * @page page_iface_xdg_surface xdg_surface
++ * @section page_iface_xdg_surface_desc Description
++ *
++ * An interface that may be implemented by a wl_surface, for
++ * implementations that provide a desktop-style user interface.
++ *
++ * It provides a base set of functionality required to construct user
++ * interface elements requiring management by the compositor, such as
++ * toplevel windows, menus, etc. The types of functionality are split into
++ * xdg_surface roles.
++ *
++ * Creating an xdg_surface does not set the role for a wl_surface. In order
++ * to map an xdg_surface, the client must create a role-specific object
++ * using, e.g., get_toplevel, get_popup. The wl_surface for any given
++ * xdg_surface can have at most one role, and may not be assigned any role
++ * not based on xdg_surface.
++ *
++ * A role must be assigned before any other requests are made to the
++ * xdg_surface object.
++ *
++ * The client must call wl_surface.commit on the corresponding wl_surface
++ * for the xdg_surface state to take effect.
++ *
++ * Creating an xdg_surface from a wl_surface which has a buffer attached or
++ * committed is a client error, and any attempts by a client to attach or
++ * manipulate a buffer prior to the first xdg_surface.configure call must
++ * also be treated as errors.
++ *
++ * Mapping an xdg_surface-based role surface is defined as making it
++ * possible for the surface to be shown by the compositor. Note that
++ * a mapped surface is not guaranteed to be visible once it is mapped.
++ *
++ * For an xdg_surface to be mapped by the compositor, the following
++ * conditions must be met:
++ * (1) the client has assigned an xdg_surface-based role to the surface
++ * (2) the client has set and committed the xdg_surface state and the
++ * role-dependent state to the surface
++ * (3) the client has committed a buffer to the surface
++ *
++ * A newly-unmapped surface is considered to have met condition (1) out
++ * of the 3 required conditions for mapping a surface if its role surface
++ * has not been destroyed.
++ * @section page_iface_xdg_surface_api API
++ * See @ref iface_xdg_surface.
++ */
++/**
++ * @defgroup iface_xdg_surface The xdg_surface interface
++ *
++ * An interface that may be implemented by a wl_surface, for
++ * implementations that provide a desktop-style user interface.
++ *
++ * It provides a base set of functionality required to construct user
++ * interface elements requiring management by the compositor, such as
++ * toplevel windows, menus, etc. The types of functionality are split into
++ * xdg_surface roles.
++ *
++ * Creating an xdg_surface does not set the role for a wl_surface. In order
++ * to map an xdg_surface, the client must create a role-specific object
++ * using, e.g., get_toplevel, get_popup. The wl_surface for any given
++ * xdg_surface can have at most one role, and may not be assigned any role
++ * not based on xdg_surface.
++ *
++ * A role must be assigned before any other requests are made to the
++ * xdg_surface object.
++ *
++ * The client must call wl_surface.commit on the corresponding wl_surface
++ * for the xdg_surface state to take effect.
++ *
++ * Creating an xdg_surface from a wl_surface which has a buffer attached or
++ * committed is a client error, and any attempts by a client to attach or
++ * manipulate a buffer prior to the first xdg_surface.configure call must
++ * also be treated as errors.
++ *
++ * Mapping an xdg_surface-based role surface is defined as making it
++ * possible for the surface to be shown by the compositor. Note that
++ * a mapped surface is not guaranteed to be visible once it is mapped.
++ *
++ * For an xdg_surface to be mapped by the compositor, the following
++ * conditions must be met:
++ * (1) the client has assigned an xdg_surface-based role to the surface
++ * (2) the client has set and committed the xdg_surface state and the
++ * role-dependent state to the surface
++ * (3) the client has committed a buffer to the surface
++ *
++ * A newly-unmapped surface is considered to have met condition (1) out
++ * of the 3 required conditions for mapping a surface if its role surface
++ * has not been destroyed.
++ */
++extern const struct wl_interface xdg_surface_interface;
++/**
++ * @page page_iface_xdg_toplevel xdg_toplevel
++ * @section page_iface_xdg_toplevel_desc Description
++ *
++ * This interface defines an xdg_surface role which allows a surface to,
++ * among other things, set window-like properties such as maximize,
++ * fullscreen, and minimize, set application-specific metadata like title and
++ * id, and well as trigger user interactive operations such as interactive
++ * resize and move.
++ *
++ * Unmapping an xdg_toplevel means that the surface cannot be shown
++ * by the compositor until it is explicitly mapped again.
++ * All active operations (e.g., move, resize) are canceled and all
++ * attributes (e.g. title, state, stacking, ...) are discarded for
++ * an xdg_toplevel surface when it is unmapped.
++ *
++ * Attaching a null buffer to a toplevel unmaps the surface.
++ * @section page_iface_xdg_toplevel_api API
++ * See @ref iface_xdg_toplevel.
++ */
++/**
++ * @defgroup iface_xdg_toplevel The xdg_toplevel interface
++ *
++ * This interface defines an xdg_surface role which allows a surface to,
++ * among other things, set window-like properties such as maximize,
++ * fullscreen, and minimize, set application-specific metadata like title and
++ * id, and well as trigger user interactive operations such as interactive
++ * resize and move.
++ *
++ * Unmapping an xdg_toplevel means that the surface cannot be shown
++ * by the compositor until it is explicitly mapped again.
++ * All active operations (e.g., move, resize) are canceled and all
++ * attributes (e.g. title, state, stacking, ...) are discarded for
++ * an xdg_toplevel surface when it is unmapped.
++ *
++ * Attaching a null buffer to a toplevel unmaps the surface.
++ */
++extern const struct wl_interface xdg_toplevel_interface;
++/**
++ * @page page_iface_xdg_popup xdg_popup
++ * @section page_iface_xdg_popup_desc Description
++ *
++ * A popup surface is a short-lived, temporary surface. It can be used to
++ * implement for example menus, popovers, tooltips and other similar user
++ * interface concepts.
++ *
++ * A popup can be made to take an explicit grab. See xdg_popup.grab for
++ * details.
++ *
++ * When the popup is dismissed, a popup_done event will be sent out, and at
++ * the same time the surface will be unmapped. See the xdg_popup.popup_done
++ * event for details.
++ *
++ * Explicitly destroying the xdg_popup object will also dismiss the popup and
++ * unmap the surface. Clients that want to dismiss the popup when another
++ * surface of their own is clicked should dismiss the popup using the destroy
++ * request.
++ *
++ * A newly created xdg_popup will be stacked on top of all previously created
++ * xdg_popup surfaces associated with the same xdg_toplevel.
++ *
++ * The parent of an xdg_popup must be mapped (see the xdg_surface
++ * description) before the xdg_popup itself.
++ *
++ * The client must call wl_surface.commit on the corresponding wl_surface
++ * for the xdg_popup state to take effect.
++ * @section page_iface_xdg_popup_api API
++ * See @ref iface_xdg_popup.
++ */
++/**
++ * @defgroup iface_xdg_popup The xdg_popup interface
++ *
++ * A popup surface is a short-lived, temporary surface. It can be used to
++ * implement for example menus, popovers, tooltips and other similar user
++ * interface concepts.
++ *
++ * A popup can be made to take an explicit grab. See xdg_popup.grab for
++ * details.
++ *
++ * When the popup is dismissed, a popup_done event will be sent out, and at
++ * the same time the surface will be unmapped. See the xdg_popup.popup_done
++ * event for details.
++ *
++ * Explicitly destroying the xdg_popup object will also dismiss the popup and
++ * unmap the surface. Clients that want to dismiss the popup when another
++ * surface of their own is clicked should dismiss the popup using the destroy
++ * request.
++ *
++ * A newly created xdg_popup will be stacked on top of all previously created
++ * xdg_popup surfaces associated with the same xdg_toplevel.
++ *
++ * The parent of an xdg_popup must be mapped (see the xdg_surface
++ * description) before the xdg_popup itself.
++ *
++ * The client must call wl_surface.commit on the corresponding wl_surface
++ * for the xdg_popup state to take effect.
++ */
++extern const struct wl_interface xdg_popup_interface;
++
++#ifndef XDG_WM_BASE_ERROR_ENUM
++#define XDG_WM_BASE_ERROR_ENUM
++enum xdg_wm_base_error {
++	/**
++	 * given wl_surface has another role
++	 */
++	XDG_WM_BASE_ERROR_ROLE = 0,
++	/**
++	 * xdg_wm_base was destroyed before children
++	 */
++	XDG_WM_BASE_ERROR_DEFUNCT_SURFACES = 1,
++	/**
++	 * the client tried to map or destroy a non-topmost popup
++	 */
++	XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP = 2,
++	/**
++	 * the client specified an invalid popup parent surface
++	 */
++	XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT = 3,
++	/**
++	 * the client provided an invalid surface state
++	 */
++	XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE = 4,
++	/**
++	 * the client provided an invalid positioner
++	 */
++	XDG_WM_BASE_ERROR_INVALID_POSITIONER = 5,
++};
++#endif /* XDG_WM_BASE_ERROR_ENUM */
++
++/**
++ * @ingroup iface_xdg_wm_base
++ * @struct xdg_wm_base_listener
++ */
++struct xdg_wm_base_listener {
++	/**
++	 * check if the client is alive
++	 *
++	 * The ping event asks the client if it's still alive. Pass the
++	 * serial specified in the event back to the compositor by sending
++	 * a "pong" request back with the specified serial. See
++	 * xdg_wm_base.pong.
++	 *
++	 * Compositors can use this to determine if the client is still
++	 * alive. It's unspecified what will happen if the client doesn't
++	 * respond to the ping request, or in what timeframe. Clients
++	 * should try to respond in a reasonable amount of time.
++	 *
++	 * A compositor is free to ping in any way it wants, but a client
++	 * must always respond to any xdg_wm_base object it created.
++	 * @param serial pass this to the pong request
++	 */
++	void (*ping)(void *data,
++		     struct xdg_wm_base *xdg_wm_base,
++		     uint32_t serial);
++};
++
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++static inline int
++xdg_wm_base_add_listener(struct xdg_wm_base *xdg_wm_base,
++			 const struct xdg_wm_base_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) xdg_wm_base,
++				     (void (**)(void)) listener, data);
++}
++
++#define XDG_WM_BASE_DESTROY 0
++#define XDG_WM_BASE_CREATE_POSITIONER 1
++#define XDG_WM_BASE_GET_XDG_SURFACE 2
++#define XDG_WM_BASE_PONG 3
++
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++#define XDG_WM_BASE_PING_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++#define XDG_WM_BASE_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++#define XDG_WM_BASE_CREATE_POSITIONER_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++#define XDG_WM_BASE_GET_XDG_SURFACE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_wm_base
++ */
++#define XDG_WM_BASE_PONG_SINCE_VERSION 1
++
++/** @ingroup iface_xdg_wm_base */
++static inline void
++xdg_wm_base_set_user_data(struct xdg_wm_base *xdg_wm_base, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) xdg_wm_base, user_data);
++}
++
++/** @ingroup iface_xdg_wm_base */
++static inline void *
++xdg_wm_base_get_user_data(struct xdg_wm_base *xdg_wm_base)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) xdg_wm_base);
++}
++
++static inline uint32_t
++xdg_wm_base_get_version(struct xdg_wm_base *xdg_wm_base)
++{
++	return wl_proxy_get_version((struct wl_proxy *) xdg_wm_base);
++}
++
++/**
++ * @ingroup iface_xdg_wm_base
++ *
++ * Destroy this xdg_wm_base object.
++ *
++ * Destroying a bound xdg_wm_base object while there are surfaces
++ * still alive created by this xdg_wm_base object instance is illegal
++ * and will result in a protocol error.
++ */
++static inline void
++xdg_wm_base_destroy(struct xdg_wm_base *xdg_wm_base)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_wm_base,
++			 XDG_WM_BASE_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) xdg_wm_base);
++}
++
++/**
++ * @ingroup iface_xdg_wm_base
++ *
++ * Create a positioner object. A positioner object is used to position
++ * surfaces relative to some parent surface. See the interface description
++ * and xdg_surface.get_popup for details.
++ */
++static inline struct xdg_positioner *
++xdg_wm_base_create_positioner(struct xdg_wm_base *xdg_wm_base)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_constructor((struct wl_proxy *) xdg_wm_base,
++			 XDG_WM_BASE_CREATE_POSITIONER, &xdg_positioner_interface, NULL);
++
++	return (struct xdg_positioner *) id;
++}
++
++/**
++ * @ingroup iface_xdg_wm_base
++ *
++ * This creates an xdg_surface for the given surface. While xdg_surface
++ * itself is not a role, the corresponding surface may only be assigned
++ * a role extending xdg_surface, such as xdg_toplevel or xdg_popup.
++ *
++ * This creates an xdg_surface for the given surface. An xdg_surface is
++ * used as basis to define a role to a given surface, such as xdg_toplevel
++ * or xdg_popup. It also manages functionality shared between xdg_surface
++ * based surface roles.
++ *
++ * See the documentation of xdg_surface for more details about what an
++ * xdg_surface is and how it is used.
++ */
++static inline struct xdg_surface *
++xdg_wm_base_get_xdg_surface(struct xdg_wm_base *xdg_wm_base, struct wl_surface *surface)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_constructor((struct wl_proxy *) xdg_wm_base,
++			 XDG_WM_BASE_GET_XDG_SURFACE, &xdg_surface_interface, NULL, surface);
++
++	return (struct xdg_surface *) id;
++}
++
++/**
++ * @ingroup iface_xdg_wm_base
++ *
++ * A client must respond to a ping event with a pong request or
++ * the client may be deemed unresponsive. See xdg_wm_base.ping.
++ */
++static inline void
++xdg_wm_base_pong(struct xdg_wm_base *xdg_wm_base, uint32_t serial)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_wm_base,
++			 XDG_WM_BASE_PONG, serial);
++}
++
++#ifndef XDG_POSITIONER_ERROR_ENUM
++#define XDG_POSITIONER_ERROR_ENUM
++enum xdg_positioner_error {
++	/**
++	 * invalid input provided
++	 */
++	XDG_POSITIONER_ERROR_INVALID_INPUT = 0,
++};
++#endif /* XDG_POSITIONER_ERROR_ENUM */
++
++#ifndef XDG_POSITIONER_ANCHOR_ENUM
++#define XDG_POSITIONER_ANCHOR_ENUM
++enum xdg_positioner_anchor {
++	XDG_POSITIONER_ANCHOR_NONE = 0,
++	XDG_POSITIONER_ANCHOR_TOP = 1,
++	XDG_POSITIONER_ANCHOR_BOTTOM = 2,
++	XDG_POSITIONER_ANCHOR_LEFT = 3,
++	XDG_POSITIONER_ANCHOR_RIGHT = 4,
++	XDG_POSITIONER_ANCHOR_TOP_LEFT = 5,
++	XDG_POSITIONER_ANCHOR_BOTTOM_LEFT = 6,
++	XDG_POSITIONER_ANCHOR_TOP_RIGHT = 7,
++	XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT = 8,
++};
++#endif /* XDG_POSITIONER_ANCHOR_ENUM */
++
++#ifndef XDG_POSITIONER_GRAVITY_ENUM
++#define XDG_POSITIONER_GRAVITY_ENUM
++enum xdg_positioner_gravity {
++	XDG_POSITIONER_GRAVITY_NONE = 0,
++	XDG_POSITIONER_GRAVITY_TOP = 1,
++	XDG_POSITIONER_GRAVITY_BOTTOM = 2,
++	XDG_POSITIONER_GRAVITY_LEFT = 3,
++	XDG_POSITIONER_GRAVITY_RIGHT = 4,
++	XDG_POSITIONER_GRAVITY_TOP_LEFT = 5,
++	XDG_POSITIONER_GRAVITY_BOTTOM_LEFT = 6,
++	XDG_POSITIONER_GRAVITY_TOP_RIGHT = 7,
++	XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT = 8,
++};
++#endif /* XDG_POSITIONER_GRAVITY_ENUM */
++
++#ifndef XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_ENUM
++#define XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_ENUM
++/**
++ * @ingroup iface_xdg_positioner
++ * vertically resize the surface
++ *
++ * Resize the surface vertically so that it is completely unconstrained.
++ */
++enum xdg_positioner_constraint_adjustment {
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE = 0,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X = 1,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y = 2,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X = 4,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y = 8,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X = 16,
++	XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_Y = 32,
++};
++#endif /* XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_ENUM */
++
++#define XDG_POSITIONER_DESTROY 0
++#define XDG_POSITIONER_SET_SIZE 1
++#define XDG_POSITIONER_SET_ANCHOR_RECT 2
++#define XDG_POSITIONER_SET_ANCHOR 3
++#define XDG_POSITIONER_SET_GRAVITY 4
++#define XDG_POSITIONER_SET_CONSTRAINT_ADJUSTMENT 5
++#define XDG_POSITIONER_SET_OFFSET 6
++#define XDG_POSITIONER_SET_REACTIVE 7
++#define XDG_POSITIONER_SET_PARENT_SIZE 8
++#define XDG_POSITIONER_SET_PARENT_CONFIGURE 9
++
++
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_SIZE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_ANCHOR_RECT_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_ANCHOR_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_GRAVITY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_CONSTRAINT_ADJUSTMENT_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_OFFSET_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_REACTIVE_SINCE_VERSION 3
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_PARENT_SIZE_SINCE_VERSION 3
++/**
++ * @ingroup iface_xdg_positioner
++ */
++#define XDG_POSITIONER_SET_PARENT_CONFIGURE_SINCE_VERSION 3
++
++/** @ingroup iface_xdg_positioner */
++static inline void
++xdg_positioner_set_user_data(struct xdg_positioner *xdg_positioner, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) xdg_positioner, user_data);
++}
++
++/** @ingroup iface_xdg_positioner */
++static inline void *
++xdg_positioner_get_user_data(struct xdg_positioner *xdg_positioner)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) xdg_positioner);
++}
++
++static inline uint32_t
++xdg_positioner_get_version(struct xdg_positioner *xdg_positioner)
++{
++	return wl_proxy_get_version((struct wl_proxy *) xdg_positioner);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Notify the compositor that the xdg_positioner will no longer be used.
++ */
++static inline void
++xdg_positioner_destroy(struct xdg_positioner *xdg_positioner)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) xdg_positioner);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Set the size of the surface that is to be positioned with the positioner
++ * object. The size is in surface-local coordinates and corresponds to the
++ * window geometry. See xdg_surface.set_window_geometry.
++ *
++ * If a zero or negative size is set the invalid_input error is raised.
++ */
++static inline void
++xdg_positioner_set_size(struct xdg_positioner *xdg_positioner, int32_t width, int32_t height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_SIZE, width, height);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Specify the anchor rectangle within the parent surface that the child
++ * surface will be placed relative to. The rectangle is relative to the
++ * window geometry as defined by xdg_surface.set_window_geometry of the
++ * parent surface.
++ *
++ * When the xdg_positioner object is used to position a child surface, the
++ * anchor rectangle may not extend outside the window geometry of the
++ * positioned child's parent surface.
++ *
++ * If a negative size is set the invalid_input error is raised.
++ */
++static inline void
++xdg_positioner_set_anchor_rect(struct xdg_positioner *xdg_positioner, int32_t x, int32_t y, int32_t width, int32_t height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_ANCHOR_RECT, x, y, width, height);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Defines the anchor point for the anchor rectangle. The specified anchor
++ * is used derive an anchor point that the child surface will be
++ * positioned relative to. If a corner anchor is set (e.g. 'top_left' or
++ * 'bottom_right'), the anchor point will be at the specified corner;
++ * otherwise, the derived anchor point will be centered on the specified
++ * edge, or in the center of the anchor rectangle if no edge is specified.
++ */
++static inline void
++xdg_positioner_set_anchor(struct xdg_positioner *xdg_positioner, uint32_t anchor)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_ANCHOR, anchor);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Defines in what direction a surface should be positioned, relative to
++ * the anchor point of the parent surface. If a corner gravity is
++ * specified (e.g. 'bottom_right' or 'top_left'), then the child surface
++ * will be placed towards the specified gravity; otherwise, the child
++ * surface will be centered over the anchor point on any axis that had no
++ * gravity specified.
++ */
++static inline void
++xdg_positioner_set_gravity(struct xdg_positioner *xdg_positioner, uint32_t gravity)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_GRAVITY, gravity);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Specify how the window should be positioned if the originally intended
++ * position caused the surface to be constrained, meaning at least
++ * partially outside positioning boundaries set by the compositor. The
++ * adjustment is set by constructing a bitmask describing the adjustment to
++ * be made when the surface is constrained on that axis.
++ *
++ * If no bit for one axis is set, the compositor will assume that the child
++ * surface should not change its position on that axis when constrained.
++ *
++ * If more than one bit for one axis is set, the order of how adjustments
++ * are applied is specified in the corresponding adjustment descriptions.
++ *
++ * The default adjustment is none.
++ */
++static inline void
++xdg_positioner_set_constraint_adjustment(struct xdg_positioner *xdg_positioner, uint32_t constraint_adjustment)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_CONSTRAINT_ADJUSTMENT, constraint_adjustment);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Specify the surface position offset relative to the position of the
++ * anchor on the anchor rectangle and the anchor on the surface. For
++ * example if the anchor of the anchor rectangle is at (x, y), the surface
++ * has the gravity bottom|right, and the offset is (ox, oy), the calculated
++ * surface position will be (x + ox, y + oy). The offset position of the
++ * surface is the one used for constraint testing. See
++ * set_constraint_adjustment.
++ *
++ * An example use case is placing a popup menu on top of a user interface
++ * element, while aligning the user interface element of the parent surface
++ * with some user interface element placed somewhere in the popup surface.
++ */
++static inline void
++xdg_positioner_set_offset(struct xdg_positioner *xdg_positioner, int32_t x, int32_t y)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_OFFSET, x, y);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * When set reactive, the surface is reconstrained if the conditions used
++ * for constraining changed, e.g. the parent window moved.
++ *
++ * If the conditions changed and the popup was reconstrained, an
++ * xdg_popup.configure event is sent with updated geometry, followed by an
++ * xdg_surface.configure event.
++ */
++static inline void
++xdg_positioner_set_reactive(struct xdg_positioner *xdg_positioner)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_REACTIVE);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Set the parent window geometry the compositor should use when
++ * positioning the popup. The compositor may use this information to
++ * determine the future state the popup should be constrained using. If
++ * this doesn't match the dimension of the parent the popup is eventually
++ * positioned against, the behavior is undefined.
++ *
++ * The arguments are given in the surface-local coordinate space.
++ */
++static inline void
++xdg_positioner_set_parent_size(struct xdg_positioner *xdg_positioner, int32_t parent_width, int32_t parent_height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_PARENT_SIZE, parent_width, parent_height);
++}
++
++/**
++ * @ingroup iface_xdg_positioner
++ *
++ * Set the serial of a xdg_surface.configure event this positioner will be
++ * used in response to. The compositor may use this information together
++ * with set_parent_size to determine what future state the popup should be
++ * constrained using.
++ */
++static inline void
++xdg_positioner_set_parent_configure(struct xdg_positioner *xdg_positioner, uint32_t serial)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_positioner,
++			 XDG_POSITIONER_SET_PARENT_CONFIGURE, serial);
++}
++
++#ifndef XDG_SURFACE_ERROR_ENUM
++#define XDG_SURFACE_ERROR_ENUM
++enum xdg_surface_error {
++	XDG_SURFACE_ERROR_NOT_CONSTRUCTED = 1,
++	XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED = 2,
++	XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER = 3,
++};
++#endif /* XDG_SURFACE_ERROR_ENUM */
++
++/**
++ * @ingroup iface_xdg_surface
++ * @struct xdg_surface_listener
++ */
++struct xdg_surface_listener {
++	/**
++	 * suggest a surface change
++	 *
++	 * The configure event marks the end of a configure sequence. A
++	 * configure sequence is a set of one or more events configuring
++	 * the state of the xdg_surface, including the final
++	 * xdg_surface.configure event.
++	 *
++	 * Where applicable, xdg_surface surface roles will during a
++	 * configure sequence extend this event as a latched state sent as
++	 * events before the xdg_surface.configure event. Such events
++	 * should be considered to make up a set of atomically applied
++	 * configuration states, where the xdg_surface.configure commits
++	 * the accumulated state.
++	 *
++	 * Clients should arrange their surface for the new states, and
++	 * then send an ack_configure request with the serial sent in this
++	 * configure event at some point before committing the new surface.
++	 *
++	 * If the client receives multiple configure events before it can
++	 * respond to one, it is free to discard all but the last event it
++	 * received.
++	 * @param serial serial of the configure event
++	 */
++	void (*configure)(void *data,
++			  struct xdg_surface *xdg_surface,
++			  uint32_t serial);
++};
++
++/**
++ * @ingroup iface_xdg_surface
++ */
++static inline int
++xdg_surface_add_listener(struct xdg_surface *xdg_surface,
++			 const struct xdg_surface_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) xdg_surface,
++				     (void (**)(void)) listener, data);
++}
++
++#define XDG_SURFACE_DESTROY 0
++#define XDG_SURFACE_GET_TOPLEVEL 1
++#define XDG_SURFACE_GET_POPUP 2
++#define XDG_SURFACE_SET_WINDOW_GEOMETRY 3
++#define XDG_SURFACE_ACK_CONFIGURE 4
++
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_CONFIGURE_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_GET_TOPLEVEL_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_GET_POPUP_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_SET_WINDOW_GEOMETRY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_surface
++ */
++#define XDG_SURFACE_ACK_CONFIGURE_SINCE_VERSION 1
++
++/** @ingroup iface_xdg_surface */
++static inline void
++xdg_surface_set_user_data(struct xdg_surface *xdg_surface, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) xdg_surface, user_data);
++}
++
++/** @ingroup iface_xdg_surface */
++static inline void *
++xdg_surface_get_user_data(struct xdg_surface *xdg_surface)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) xdg_surface);
++}
++
++static inline uint32_t
++xdg_surface_get_version(struct xdg_surface *xdg_surface)
++{
++	return wl_proxy_get_version((struct wl_proxy *) xdg_surface);
++}
++
++/**
++ * @ingroup iface_xdg_surface
++ *
++ * Destroy the xdg_surface object. An xdg_surface must only be destroyed
++ * after its role object has been destroyed.
++ */
++static inline void
++xdg_surface_destroy(struct xdg_surface *xdg_surface)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_surface,
++			 XDG_SURFACE_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) xdg_surface);
++}
++
++/**
++ * @ingroup iface_xdg_surface
++ *
++ * This creates an xdg_toplevel object for the given xdg_surface and gives
++ * the associated wl_surface the xdg_toplevel role.
++ *
++ * See the documentation of xdg_toplevel for more details about what an
++ * xdg_toplevel is and how it is used.
++ */
++static inline struct xdg_toplevel *
++xdg_surface_get_toplevel(struct xdg_surface *xdg_surface)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_constructor((struct wl_proxy *) xdg_surface,
++			 XDG_SURFACE_GET_TOPLEVEL, &xdg_toplevel_interface, NULL);
++
++	return (struct xdg_toplevel *) id;
++}
++
++/**
++ * @ingroup iface_xdg_surface
++ *
++ * This creates an xdg_popup object for the given xdg_surface and gives
++ * the associated wl_surface the xdg_popup role.
++ *
++ * If null is passed as a parent, a parent surface must be specified using
++ * some other protocol, before committing the initial state.
++ *
++ * See the documentation of xdg_popup for more details about what an
++ * xdg_popup is and how it is used.
++ */
++static inline struct xdg_popup *
++xdg_surface_get_popup(struct xdg_surface *xdg_surface, struct xdg_surface *parent, struct xdg_positioner *positioner)
++{
++	struct wl_proxy *id;
++
++	id = wl_proxy_marshal_constructor((struct wl_proxy *) xdg_surface,
++			 XDG_SURFACE_GET_POPUP, &xdg_popup_interface, NULL, parent, positioner);
++
++	return (struct xdg_popup *) id;
++}
++
++/**
++ * @ingroup iface_xdg_surface
++ *
++ * The window geometry of a surface is its "visible bounds" from the
++ * user's perspective. Client-side decorations often have invisible
++ * portions like drop-shadows which should be ignored for the
++ * purposes of aligning, placing and constraining windows.
++ *
++ * The window geometry is double buffered, and will be applied at the
++ * time wl_surface.commit of the corresponding wl_surface is called.
++ *
++ * When maintaining a position, the compositor should treat the (x, y)
++ * coordinate of the window geometry as the top left corner of the window.
++ * A client changing the (x, y) window geometry coordinate should in
++ * general not alter the position of the window.
++ *
++ * Once the window geometry of the surface is set, it is not possible to
++ * unset it, and it will remain the same until set_window_geometry is
++ * called again, even if a new subsurface or buffer is attached.
++ *
++ * If never set, the value is the full bounds of the surface,
++ * including any subsurfaces. This updates dynamically on every
++ * commit. This unset is meant for extremely simple clients.
++ *
++ * The arguments are given in the surface-local coordinate space of
++ * the wl_surface associated with this xdg_surface.
++ *
++ * The width and height must be greater than zero. Setting an invalid size
++ * will raise an error. When applied, the effective window geometry will be
++ * the set window geometry clamped to the bounding rectangle of the
++ * combined geometry of the surface of the xdg_surface and the associated
++ * subsurfaces.
++ */
++static inline void
++xdg_surface_set_window_geometry(struct xdg_surface *xdg_surface, int32_t x, int32_t y, int32_t width, int32_t height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_surface,
++			 XDG_SURFACE_SET_WINDOW_GEOMETRY, x, y, width, height);
++}
++
++/**
++ * @ingroup iface_xdg_surface
++ *
++ * When a configure event is received, if a client commits the
++ * surface in response to the configure event, then the client
++ * must make an ack_configure request sometime before the commit
++ * request, passing along the serial of the configure event.
++ *
++ * For instance, for toplevel surfaces the compositor might use this
++ * information to move a surface to the top left only when the client has
++ * drawn itself for the maximized or fullscreen state.
++ *
++ * If the client receives multiple configure events before it
++ * can respond to one, it only has to ack the last configure event.
++ *
++ * A client is not required to commit immediately after sending
++ * an ack_configure request - it may even ack_configure several times
++ * before its next surface commit.
++ *
++ * A client may send multiple ack_configure requests before committing, but
++ * only the last request sent before a commit indicates which configure
++ * event the client really is responding to.
++ */
++static inline void
++xdg_surface_ack_configure(struct xdg_surface *xdg_surface, uint32_t serial)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_surface,
++			 XDG_SURFACE_ACK_CONFIGURE, serial);
++}
++
++#ifndef XDG_TOPLEVEL_RESIZE_EDGE_ENUM
++#define XDG_TOPLEVEL_RESIZE_EDGE_ENUM
++/**
++ * @ingroup iface_xdg_toplevel
++ * edge values for resizing
++ *
++ * These values are used to indicate which edge of a surface
++ * is being dragged in a resize operation.
++ */
++enum xdg_toplevel_resize_edge {
++	XDG_TOPLEVEL_RESIZE_EDGE_NONE = 0,
++	XDG_TOPLEVEL_RESIZE_EDGE_TOP = 1,
++	XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM = 2,
++	XDG_TOPLEVEL_RESIZE_EDGE_LEFT = 4,
++	XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT = 5,
++	XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT = 6,
++	XDG_TOPLEVEL_RESIZE_EDGE_RIGHT = 8,
++	XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT = 9,
++	XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT = 10,
++};
++#endif /* XDG_TOPLEVEL_RESIZE_EDGE_ENUM */
++
++#ifndef XDG_TOPLEVEL_STATE_ENUM
++#define XDG_TOPLEVEL_STATE_ENUM
++/**
++ * @ingroup iface_xdg_toplevel
++ * the surface is tiled
++ *
++ * The window is currently in a tiled layout and the bottom edge is
++ * considered to be adjacent to another part of the tiling grid.
++ */
++enum xdg_toplevel_state {
++	/**
++	 * the surface is maximized
++	 */
++	XDG_TOPLEVEL_STATE_MAXIMIZED = 1,
++	/**
++	 * the surface is fullscreen
++	 */
++	XDG_TOPLEVEL_STATE_FULLSCREEN = 2,
++	/**
++	 * the surface is being resized
++	 */
++	XDG_TOPLEVEL_STATE_RESIZING = 3,
++	/**
++	 * the surface is now activated
++	 */
++	XDG_TOPLEVEL_STATE_ACTIVATED = 4,
++	/**
++	 * @since 2
++	 */
++	XDG_TOPLEVEL_STATE_TILED_LEFT = 5,
++	/**
++	 * @since 2
++	 */
++	XDG_TOPLEVEL_STATE_TILED_RIGHT = 6,
++	/**
++	 * @since 2
++	 */
++	XDG_TOPLEVEL_STATE_TILED_TOP = 7,
++	/**
++	 * @since 2
++	 */
++	XDG_TOPLEVEL_STATE_TILED_BOTTOM = 8,
++};
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_STATE_TILED_LEFT_SINCE_VERSION 2
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_STATE_TILED_RIGHT_SINCE_VERSION 2
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_STATE_TILED_TOP_SINCE_VERSION 2
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_STATE_TILED_BOTTOM_SINCE_VERSION 2
++#endif /* XDG_TOPLEVEL_STATE_ENUM */
++
++/**
++ * @ingroup iface_xdg_toplevel
++ * @struct xdg_toplevel_listener
++ */
++struct xdg_toplevel_listener {
++	/**
++	 * suggest a surface change
++	 *
++	 * This configure event asks the client to resize its toplevel
++	 * surface or to change its state. The configured state should not
++	 * be applied immediately. See xdg_surface.configure for details.
++	 *
++	 * The width and height arguments specify a hint to the window
++	 * about how its surface should be resized in window geometry
++	 * coordinates. See set_window_geometry.
++	 *
++	 * If the width or height arguments are zero, it means the client
++	 * should decide its own window dimension. This may happen when the
++	 * compositor needs to configure the state of the surface but
++	 * doesn't have any information about any previous or expected
++	 * dimension.
++	 *
++	 * The states listed in the event specify how the width/height
++	 * arguments should be interpreted, and possibly how it should be
++	 * drawn.
++	 *
++	 * Clients must send an ack_configure in response to this event.
++	 * See xdg_surface.configure and xdg_surface.ack_configure for
++	 * details.
++	 */
++	void (*configure)(void *data,
++			  struct xdg_toplevel *xdg_toplevel,
++			  int32_t width,
++			  int32_t height,
++			  struct wl_array *states);
++	/**
++	 * surface wants to be closed
++	 *
++	 * The close event is sent by the compositor when the user wants
++	 * the surface to be closed. This should be equivalent to the user
++	 * clicking the close button in client-side decorations, if your
++	 * application has any.
++	 *
++	 * This is only a request that the user intends to close the
++	 * window. The client may choose to ignore this request, or show a
++	 * dialog to ask the user to save their data, etc.
++	 */
++	void (*close)(void *data,
++		      struct xdg_toplevel *xdg_toplevel);
++};
++
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++static inline int
++xdg_toplevel_add_listener(struct xdg_toplevel *xdg_toplevel,
++			  const struct xdg_toplevel_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) xdg_toplevel,
++				     (void (**)(void)) listener, data);
++}
++
++#define XDG_TOPLEVEL_DESTROY 0
++#define XDG_TOPLEVEL_SET_PARENT 1
++#define XDG_TOPLEVEL_SET_TITLE 2
++#define XDG_TOPLEVEL_SET_APP_ID 3
++#define XDG_TOPLEVEL_SHOW_WINDOW_MENU 4
++#define XDG_TOPLEVEL_MOVE 5
++#define XDG_TOPLEVEL_RESIZE 6
++#define XDG_TOPLEVEL_SET_MAX_SIZE 7
++#define XDG_TOPLEVEL_SET_MIN_SIZE 8
++#define XDG_TOPLEVEL_SET_MAXIMIZED 9
++#define XDG_TOPLEVEL_UNSET_MAXIMIZED 10
++#define XDG_TOPLEVEL_SET_FULLSCREEN 11
++#define XDG_TOPLEVEL_UNSET_FULLSCREEN 12
++#define XDG_TOPLEVEL_SET_MINIMIZED 13
++
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_CONFIGURE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_CLOSE_SINCE_VERSION 1
++
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_PARENT_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_TITLE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_APP_ID_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SHOW_WINDOW_MENU_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_MOVE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_RESIZE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_MAX_SIZE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_MIN_SIZE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_MAXIMIZED_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_UNSET_MAXIMIZED_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_FULLSCREEN_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_UNSET_FULLSCREEN_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_toplevel
++ */
++#define XDG_TOPLEVEL_SET_MINIMIZED_SINCE_VERSION 1
++
++/** @ingroup iface_xdg_toplevel */
++static inline void
++xdg_toplevel_set_user_data(struct xdg_toplevel *xdg_toplevel, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) xdg_toplevel, user_data);
++}
++
++/** @ingroup iface_xdg_toplevel */
++static inline void *
++xdg_toplevel_get_user_data(struct xdg_toplevel *xdg_toplevel)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) xdg_toplevel);
++}
++
++static inline uint32_t
++xdg_toplevel_get_version(struct xdg_toplevel *xdg_toplevel)
++{
++	return wl_proxy_get_version((struct wl_proxy *) xdg_toplevel);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * This request destroys the role surface and unmaps the surface;
++ * see "Unmapping" behavior in interface section for details.
++ */
++static inline void
++xdg_toplevel_destroy(struct xdg_toplevel *xdg_toplevel)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) xdg_toplevel);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Set the "parent" of this surface. This surface should be stacked
++ * above the parent surface and all other ancestor surfaces.
++ *
++ * Parent windows should be set on dialogs, toolboxes, or other
++ * "auxiliary" surfaces, so that the parent is raised when the dialog
++ * is raised.
++ *
++ * Setting a null parent for a child window removes any parent-child
++ * relationship for the child. Setting a null parent for a window which
++ * currently has no parent is a no-op.
++ *
++ * If the parent is unmapped then its children are managed as
++ * though the parent of the now-unmapped parent has become the
++ * parent of this surface. If no parent exists for the now-unmapped
++ * parent then the children are managed as though they have no
++ * parent surface.
++ */
++static inline void
++xdg_toplevel_set_parent(struct xdg_toplevel *xdg_toplevel, struct xdg_toplevel *parent)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_PARENT, parent);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Set a short title for the surface.
++ *
++ * This string may be used to identify the surface in a task bar,
++ * window list, or other user interface elements provided by the
++ * compositor.
++ *
++ * The string must be encoded in UTF-8.
++ */
++static inline void
++xdg_toplevel_set_title(struct xdg_toplevel *xdg_toplevel, const char *title)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_TITLE, title);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Set an application identifier for the surface.
++ *
++ * The app ID identifies the general class of applications to which
++ * the surface belongs. The compositor can use this to group multiple
++ * surfaces together, or to determine how to launch a new application.
++ *
++ * For D-Bus activatable applications, the app ID is used as the D-Bus
++ * service name.
++ *
++ * The compositor shell will try to group application surfaces together
++ * by their app ID. As a best practice, it is suggested to select app
++ * ID's that match the basename of the application's .desktop file.
++ * For example, "org.freedesktop.FooViewer" where the .desktop file is
++ * "org.freedesktop.FooViewer.desktop".
++ *
++ * Like other properties, a set_app_id request can be sent after the
++ * xdg_toplevel has been mapped to update the property.
++ *
++ * See the desktop-entry specification [0] for more details on
++ * application identifiers and how they relate to well-known D-Bus
++ * names and .desktop files.
++ *
++ * [0] http://standards.freedesktop.org/desktop-entry-spec/
++ */
++static inline void
++xdg_toplevel_set_app_id(struct xdg_toplevel *xdg_toplevel, const char *app_id)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_APP_ID, app_id);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Clients implementing client-side decorations might want to show
++ * a context menu when right-clicking on the decorations, giving the
++ * user a menu that they can use to maximize or minimize the window.
++ *
++ * This request asks the compositor to pop up such a window menu at
++ * the given position, relative to the local surface coordinates of
++ * the parent surface. There are no guarantees as to what menu items
++ * the window menu contains.
++ *
++ * This request must be used in response to some sort of user action
++ * like a button press, key press, or touch down event.
++ */
++static inline void
++xdg_toplevel_show_window_menu(struct xdg_toplevel *xdg_toplevel, struct wl_seat *seat, uint32_t serial, int32_t x, int32_t y)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SHOW_WINDOW_MENU, seat, serial, x, y);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Start an interactive, user-driven move of the surface.
++ *
++ * This request must be used in response to some sort of user action
++ * like a button press, key press, or touch down event. The passed
++ * serial is used to determine the type of interactive move (touch,
++ * pointer, etc).
++ *
++ * The server may ignore move requests depending on the state of
++ * the surface (e.g. fullscreen or maximized), or if the passed serial
++ * is no longer valid.
++ *
++ * If triggered, the surface will lose the focus of the device
++ * (wl_pointer, wl_touch, etc) used for the move. It is up to the
++ * compositor to visually indicate that the move is taking place, such as
++ * updating a pointer cursor, during the move. There is no guarantee
++ * that the device focus will return when the move is completed.
++ */
++static inline void
++xdg_toplevel_move(struct xdg_toplevel *xdg_toplevel, struct wl_seat *seat, uint32_t serial)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_MOVE, seat, serial);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Start a user-driven, interactive resize of the surface.
++ *
++ * This request must be used in response to some sort of user action
++ * like a button press, key press, or touch down event. The passed
++ * serial is used to determine the type of interactive resize (touch,
++ * pointer, etc).
++ *
++ * The server may ignore resize requests depending on the state of
++ * the surface (e.g. fullscreen or maximized).
++ *
++ * If triggered, the client will receive configure events with the
++ * "resize" state enum value and the expected sizes. See the "resize"
++ * enum value for more details about what is required. The client
++ * must also acknowledge configure events using "ack_configure". After
++ * the resize is completed, the client will receive another "configure"
++ * event without the resize state.
++ *
++ * If triggered, the surface also will lose the focus of the device
++ * (wl_pointer, wl_touch, etc) used for the resize. It is up to the
++ * compositor to visually indicate that the resize is taking place,
++ * such as updating a pointer cursor, during the resize. There is no
++ * guarantee that the device focus will return when the resize is
++ * completed.
++ *
++ * The edges parameter specifies how the surface should be resized,
++ * and is one of the values of the resize_edge enum. The compositor
++ * may use this information to update the surface position for
++ * example when dragging the top left corner. The compositor may also
++ * use this information to adapt its behavior, e.g. choose an
++ * appropriate cursor image.
++ */
++static inline void
++xdg_toplevel_resize(struct xdg_toplevel *xdg_toplevel, struct wl_seat *seat, uint32_t serial, uint32_t edges)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_RESIZE, seat, serial, edges);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Set a maximum size for the window.
++ *
++ * The client can specify a maximum size so that the compositor does
++ * not try to configure the window beyond this size.
++ *
++ * The width and height arguments are in window geometry coordinates.
++ * See xdg_surface.set_window_geometry.
++ *
++ * Values set in this way are double-buffered. They will get applied
++ * on the next commit.
++ *
++ * The compositor can use this information to allow or disallow
++ * different states like maximize or fullscreen and draw accurate
++ * animations.
++ *
++ * Similarly, a tiling window manager may use this information to
++ * place and resize client windows in a more effective way.
++ *
++ * The client should not rely on the compositor to obey the maximum
++ * size. The compositor may decide to ignore the values set by the
++ * client and request a larger size.
++ *
++ * If never set, or a value of zero in the request, means that the
++ * client has no expected maximum size in the given dimension.
++ * As a result, a client wishing to reset the maximum size
++ * to an unspecified state can use zero for width and height in the
++ * request.
++ *
++ * Requesting a maximum size to be smaller than the minimum size of
++ * a surface is illegal and will result in a protocol error.
++ *
++ * The width and height must be greater than or equal to zero. Using
++ * strictly negative values for width and height will result in a
++ * protocol error.
++ */
++static inline void
++xdg_toplevel_set_max_size(struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_MAX_SIZE, width, height);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Set a minimum size for the window.
++ *
++ * The client can specify a minimum size so that the compositor does
++ * not try to configure the window below this size.
++ *
++ * The width and height arguments are in window geometry coordinates.
++ * See xdg_surface.set_window_geometry.
++ *
++ * Values set in this way are double-buffered. They will get applied
++ * on the next commit.
++ *
++ * The compositor can use this information to allow or disallow
++ * different states like maximize or fullscreen and draw accurate
++ * animations.
++ *
++ * Similarly, a tiling window manager may use this information to
++ * place and resize client windows in a more effective way.
++ *
++ * The client should not rely on the compositor to obey the minimum
++ * size. The compositor may decide to ignore the values set by the
++ * client and request a smaller size.
++ *
++ * If never set, or a value of zero in the request, means that the
++ * client has no expected minimum size in the given dimension.
++ * As a result, a client wishing to reset the minimum size
++ * to an unspecified state can use zero for width and height in the
++ * request.
++ *
++ * Requesting a minimum size to be larger than the maximum size of
++ * a surface is illegal and will result in a protocol error.
++ *
++ * The width and height must be greater than or equal to zero. Using
++ * strictly negative values for width and height will result in a
++ * protocol error.
++ */
++static inline void
++xdg_toplevel_set_min_size(struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_MIN_SIZE, width, height);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Maximize the surface.
++ *
++ * After requesting that the surface should be maximized, the compositor
++ * will respond by emitting a configure event. Whether this configure
++ * actually sets the window maximized is subject to compositor policies.
++ * The client must then update its content, drawing in the configured
++ * state. The client must also acknowledge the configure when committing
++ * the new content (see ack_configure).
++ *
++ * It is up to the compositor to decide how and where to maximize the
++ * surface, for example which output and what region of the screen should
++ * be used.
++ *
++ * If the surface was already maximized, the compositor will still emit
++ * a configure event with the "maximized" state.
++ *
++ * If the surface is in a fullscreen state, this request has no direct
++ * effect. It may alter the state the surface is returned to when
++ * unmaximized unless overridden by the compositor.
++ */
++static inline void
++xdg_toplevel_set_maximized(struct xdg_toplevel *xdg_toplevel)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_MAXIMIZED);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Unmaximize the surface.
++ *
++ * After requesting that the surface should be unmaximized, the compositor
++ * will respond by emitting a configure event. Whether this actually
++ * un-maximizes the window is subject to compositor policies.
++ * If available and applicable, the compositor will include the window
++ * geometry dimensions the window had prior to being maximized in the
++ * configure event. The client must then update its content, drawing it in
++ * the configured state. The client must also acknowledge the configure
++ * when committing the new content (see ack_configure).
++ *
++ * It is up to the compositor to position the surface after it was
++ * unmaximized; usually the position the surface had before maximizing, if
++ * applicable.
++ *
++ * If the surface was already not maximized, the compositor will still
++ * emit a configure event without the "maximized" state.
++ *
++ * If the surface is in a fullscreen state, this request has no direct
++ * effect. It may alter the state the surface is returned to when
++ * unmaximized unless overridden by the compositor.
++ */
++static inline void
++xdg_toplevel_unset_maximized(struct xdg_toplevel *xdg_toplevel)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_UNSET_MAXIMIZED);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Make the surface fullscreen.
++ *
++ * After requesting that the surface should be fullscreened, the
++ * compositor will respond by emitting a configure event. Whether the
++ * client is actually put into a fullscreen state is subject to compositor
++ * policies. The client must also acknowledge the configure when
++ * committing the new content (see ack_configure).
++ *
++ * The output passed by the request indicates the client's preference as
++ * to which display it should be set fullscreen on. If this value is NULL,
++ * it's up to the compositor to choose which display will be used to map
++ * this surface.
++ *
++ * If the surface doesn't cover the whole output, the compositor will
++ * position the surface in the center of the output and compensate with
++ * with border fill covering the rest of the output. The content of the
++ * border fill is undefined, but should be assumed to be in some way that
++ * attempts to blend into the surrounding area (e.g. solid black).
++ *
++ * If the fullscreened surface is not opaque, the compositor must make
++ * sure that other screen content not part of the same surface tree (made
++ * up of subsurfaces, popups or similarly coupled surfaces) are not
++ * visible below the fullscreened surface.
++ */
++static inline void
++xdg_toplevel_set_fullscreen(struct xdg_toplevel *xdg_toplevel, struct wl_output *output)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_FULLSCREEN, output);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Make the surface no longer fullscreen.
++ *
++ * After requesting that the surface should be unfullscreened, the
++ * compositor will respond by emitting a configure event.
++ * Whether this actually removes the fullscreen state of the client is
++ * subject to compositor policies.
++ *
++ * Making a surface unfullscreen sets states for the surface based on the following:
++ * * the state(s) it may have had before becoming fullscreen
++ * * any state(s) decided by the compositor
++ * * any state(s) requested by the client while the surface was fullscreen
++ *
++ * The compositor may include the previous window geometry dimensions in
++ * the configure event, if applicable.
++ *
++ * The client must also acknowledge the configure when committing the new
++ * content (see ack_configure).
++ */
++static inline void
++xdg_toplevel_unset_fullscreen(struct xdg_toplevel *xdg_toplevel)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_UNSET_FULLSCREEN);
++}
++
++/**
++ * @ingroup iface_xdg_toplevel
++ *
++ * Request that the compositor minimize your surface. There is no
++ * way to know if the surface is currently minimized, nor is there
++ * any way to unset minimization on this surface.
++ *
++ * If you are looking to throttle redrawing when minimized, please
++ * instead use the wl_surface.frame event for this, as this will
++ * also work with live previews on windows in Alt-Tab, Expose or
++ * similar compositor features.
++ */
++static inline void
++xdg_toplevel_set_minimized(struct xdg_toplevel *xdg_toplevel)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_toplevel,
++			 XDG_TOPLEVEL_SET_MINIMIZED);
++}
++
++#ifndef XDG_POPUP_ERROR_ENUM
++#define XDG_POPUP_ERROR_ENUM
++enum xdg_popup_error {
++	/**
++	 * tried to grab after being mapped
++	 */
++	XDG_POPUP_ERROR_INVALID_GRAB = 0,
++};
++#endif /* XDG_POPUP_ERROR_ENUM */
++
++/**
++ * @ingroup iface_xdg_popup
++ * @struct xdg_popup_listener
++ */
++struct xdg_popup_listener {
++	/**
++	 * configure the popup surface
++	 *
++	 * This event asks the popup surface to configure itself given
++	 * the configuration. The configured state should not be applied
++	 * immediately. See xdg_surface.configure for details.
++	 *
++	 * The x and y arguments represent the position the popup was
++	 * placed at given the xdg_positioner rule, relative to the upper
++	 * left corner of the window geometry of the parent surface.
++	 *
++	 * For version 2 or older, the configure event for an xdg_popup is
++	 * only ever sent once for the initial configuration. Starting with
++	 * version 3, it may be sent again if the popup is setup with an
++	 * xdg_positioner with set_reactive requested, or in response to
++	 * xdg_popup.reposition requests.
++	 * @param x x position relative to parent surface window geometry
++	 * @param y y position relative to parent surface window geometry
++	 * @param width window geometry width
++	 * @param height window geometry height
++	 */
++	void (*configure)(void *data,
++			  struct xdg_popup *xdg_popup,
++			  int32_t x,
++			  int32_t y,
++			  int32_t width,
++			  int32_t height);
++	/**
++	 * popup interaction is done
++	 *
++	 * The popup_done event is sent out when a popup is dismissed by
++	 * the compositor. The client should destroy the xdg_popup object
++	 * at this point.
++	 */
++	void (*popup_done)(void *data,
++			   struct xdg_popup *xdg_popup);
++	/**
++	 * signal the completion of a repositioned request
++	 *
++	 * The repositioned event is sent as part of a popup
++	 * configuration sequence, together with xdg_popup.configure and
++	 * lastly xdg_surface.configure to notify the completion of a
++	 * reposition request.
++	 *
++	 * The repositioned event is to notify about the completion of a
++	 * xdg_popup.reposition request. The token argument is the token
++	 * passed in the xdg_popup.reposition request.
++	 *
++	 * Immediately after this event is emitted, xdg_popup.configure and
++	 * xdg_surface.configure will be sent with the updated size and
++	 * position, as well as a new configure serial.
++	 *
++	 * The client should optionally update the content of the popup,
++	 * but must acknowledge the new popup configuration for the new
++	 * position to take effect. See xdg_surface.ack_configure for
++	 * details.
++	 * @param token reposition request token
++	 * @since 3
++	 */
++	void (*repositioned)(void *data,
++			     struct xdg_popup *xdg_popup,
++			     uint32_t token);
++};
++
++/**
++ * @ingroup iface_xdg_popup
++ */
++static inline int
++xdg_popup_add_listener(struct xdg_popup *xdg_popup,
++		       const struct xdg_popup_listener *listener, void *data)
++{
++	return wl_proxy_add_listener((struct wl_proxy *) xdg_popup,
++				     (void (**)(void)) listener, data);
++}
++
++#define XDG_POPUP_DESTROY 0
++#define XDG_POPUP_GRAB 1
++#define XDG_POPUP_REPOSITION 2
++
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_CONFIGURE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_POPUP_DONE_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_REPOSITIONED_SINCE_VERSION 3
++
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_DESTROY_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_GRAB_SINCE_VERSION 1
++/**
++ * @ingroup iface_xdg_popup
++ */
++#define XDG_POPUP_REPOSITION_SINCE_VERSION 3
++
++/** @ingroup iface_xdg_popup */
++static inline void
++xdg_popup_set_user_data(struct xdg_popup *xdg_popup, void *user_data)
++{
++	wl_proxy_set_user_data((struct wl_proxy *) xdg_popup, user_data);
++}
++
++/** @ingroup iface_xdg_popup */
++static inline void *
++xdg_popup_get_user_data(struct xdg_popup *xdg_popup)
++{
++	return wl_proxy_get_user_data((struct wl_proxy *) xdg_popup);
++}
++
++static inline uint32_t
++xdg_popup_get_version(struct xdg_popup *xdg_popup)
++{
++	return wl_proxy_get_version((struct wl_proxy *) xdg_popup);
++}
++
++/**
++ * @ingroup iface_xdg_popup
++ *
++ * This destroys the popup. Explicitly destroying the xdg_popup
++ * object will also dismiss the popup, and unmap the surface.
++ *
++ * If this xdg_popup is not the "topmost" popup, a protocol error
++ * will be sent.
++ */
++static inline void
++xdg_popup_destroy(struct xdg_popup *xdg_popup)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_popup,
++			 XDG_POPUP_DESTROY);
++
++	wl_proxy_destroy((struct wl_proxy *) xdg_popup);
++}
++
++/**
++ * @ingroup iface_xdg_popup
++ *
++ * This request makes the created popup take an explicit grab. An explicit
++ * grab will be dismissed when the user dismisses the popup, or when the
++ * client destroys the xdg_popup. This can be done by the user clicking
++ * outside the surface, using the keyboard, or even locking the screen
++ * through closing the lid or a timeout.
++ *
++ * If the compositor denies the grab, the popup will be immediately
++ * dismissed.
++ *
++ * This request must be used in response to some sort of user action like a
++ * button press, key press, or touch down event. The serial number of the
++ * event should be passed as 'serial'.
++ *
++ * The parent of a grabbing popup must either be an xdg_toplevel surface or
++ * another xdg_popup with an explicit grab. If the parent is another
++ * xdg_popup it means that the popups are nested, with this popup now being
++ * the topmost popup.
++ *
++ * Nested popups must be destroyed in the reverse order they were created
++ * in, e.g. the only popup you are allowed to destroy at all times is the
++ * topmost one.
++ *
++ * When compositors choose to dismiss a popup, they may dismiss every
++ * nested grabbing popup as well. When a compositor dismisses popups, it
++ * will follow the same dismissing order as required from the client.
++ *
++ * The parent of a grabbing popup must either be another xdg_popup with an
++ * active explicit grab, or an xdg_popup or xdg_toplevel, if there are no
++ * explicit grabs already taken.
++ *
++ * If the topmost grabbing popup is destroyed, the grab will be returned to
++ * the parent of the popup, if that parent previously had an explicit grab.
++ *
++ * If the parent is a grabbing popup which has already been dismissed, this
++ * popup will be immediately dismissed. If the parent is a popup that did
++ * not take an explicit grab, an error will be raised.
++ *
++ * During a popup grab, the client owning the grab will receive pointer
++ * and touch events for all their surfaces as normal (similar to an
++ * "owner-events" grab in X11 parlance), while the top most grabbing popup
++ * will always have keyboard focus.
++ */
++static inline void
++xdg_popup_grab(struct xdg_popup *xdg_popup, struct wl_seat *seat, uint32_t serial)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_popup,
++			 XDG_POPUP_GRAB, seat, serial);
++}
++
++/**
++ * @ingroup iface_xdg_popup
++ *
++ * Reposition an already-mapped popup. The popup will be placed given the
++ * details in the passed xdg_positioner object, and a
++ * xdg_popup.repositioned followed by xdg_popup.configure and
++ * xdg_surface.configure will be emitted in response. Any parameters set
++ * by the previous positioner will be discarded.
++ *
++ * The passed token will be sent in the corresponding
++ * xdg_popup.repositioned event. The new popup position will not take
++ * effect until the corresponding configure event is acknowledged by the
++ * client. See xdg_popup.repositioned for details. The token itself is
++ * opaque, and has no other special meaning.
++ *
++ * If multiple reposition requests are sent, the compositor may skip all
++ * but the last one.
++ *
++ * If the popup is repositioned in response to a configure event for its
++ * parent, the client should send an xdg_positioner.set_parent_configure
++ * and possibly a xdg_positioner.set_parent_size request to allow the
++ * compositor to properly constrain the popup.
++ *
++ * If the popup is repositioned together with a parent that is being
++ * resized, but not in response to a configure event, the client should
++ * send a xdg_positioner.set_parent_size request.
++ */
++static inline void
++xdg_popup_reposition(struct xdg_popup *xdg_popup, struct xdg_positioner *positioner, uint32_t token)
++{
++	wl_proxy_marshal((struct wl_proxy *) xdg_popup,
++			 XDG_POPUP_REPOSITION, positioner, token);
++}
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif
+-- 
+2.40.1
+
